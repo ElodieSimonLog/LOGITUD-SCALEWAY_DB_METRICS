@@ -124,11 +124,24 @@ collect_aggregated() {
 
   IFS='|' read -r total active idle waiting <<< "$conn_data"
 
-  [[ "$total" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_total" "$total" "$labels"
-  [[ "$active" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_active" "$active" "$labels"
-  [[ "$idle" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_idle" "$idle" "$labels"
+  [[ "$total"   =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_total"   "$total"   "$labels"
+  [[ "$active"  =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_active"  "$active"  "$labels"
+  [[ "$idle"    =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_idle"    "$idle"    "$labels"
   [[ "$waiting" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_waiting" "$waiting" "$labels"
 
+  # max_connections + ratio
+  local max_conn
+  max_conn=$(pg -c "SELECT setting::int FROM pg_settings WHERE name='max_connections';")
+
+  [[ "$max_conn" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_max_connections" "$max_conn" "$labels"
+
+  if [[ "$max_conn" =~ ^[0-9]+$ ]] && (( max_conn > 0 )); then
+    local ratio
+    ratio=$(echo "scale=4; $total / $max_conn" | bc)
+    add_metric "scaleway_db_pg_connections_ratio" "$ratio" "$labels"
+  fi
+
+  # tailles par base
   local db_sizes
   db_sizes=$(pg -c "
     SELECT datname, pg_database_size(datname)
@@ -169,10 +182,22 @@ collect_detailed() {
 
   IFS='|' read -r total active idle waiting <<< "$conn_data"
 
-  [[ "$total" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_total" "$total" "$labels"
-  [[ "$active" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_active" "$active" "$labels"
-  [[ "$idle" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_idle" "$idle" "$labels"
+  [[ "$total"   =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_total"   "$total"   "$labels"
+  [[ "$active"  =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_active"  "$active"  "$labels"
+  [[ "$idle"    =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_idle"    "$idle"    "$labels"
   [[ "$waiting" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_waiting" "$waiting" "$labels"
+
+  # max_connections + ratio
+  local max_conn
+  max_conn=$(pg -c "SELECT setting::int FROM pg_settings WHERE name='max_connections';")
+
+  [[ "$max_conn" =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_max_connections" "$max_conn" "$labels"
+
+  if [[ "$max_conn" =~ ^[0-9]+$ ]] && (( max_conn > 0 )); then
+    local ratio
+    ratio=$(echo "scale=4; $total / $max_conn" | bc)
+    add_metric "scaleway_db_pg_connections_ratio" "$ratio" "$labels"
+  fi
 }
 
 # ---------------------------------------------------------------------------
