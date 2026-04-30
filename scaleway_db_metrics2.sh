@@ -8,13 +8,14 @@
 # Sources de données :
 #   - API REST Scaleway  → infos statiques par instance (volume, status, max_conn, HA)
 #   - psql direct        → métriques live (connexions, tailles, requêtes lentes)
+#   - Cockpit Scaleway   → métriques infra (CPU, RAM, disk I/O, replication lag)
 #
 # Deux modes selon le nombre de bases sur l'instance :
 #   MODE AGRÉGÉ   (>= DB_AGGREGATE_THRESHOLD)  → 1 connexion/instance, top N tailles
 #   MODE DÉTAILLÉ (< DB_AGGREGATE_THRESHOLD)   → 1 connexion/base, pg_stat_statements
 #
 # Instances sur réseau privé (172.x) : skippées en psql si injoignables,
-# mais les infos API REST sont quand même collectées.
+# mais les infos API REST et Cockpit sont quand même collectées.
 #
 # Prérequis : curl, jq, psql
 #
@@ -40,6 +41,7 @@ SCW_API_BASE="https://api.scaleway.com/rdb/v1/regions/${SCW_REGION}/instances"
 DB_AGGREGATE_THRESHOLD="${DB_AGGREGATE_THRESHOLD:-50}"
 DB_TOP_N="${DB_TOP_N:-20}"
 PSQL_CONNECT_TIMEOUT="${PSQL_CONNECT_TIMEOUT:-5}"
+COCKPIT_QUERY_TIMEOUT="${COCKPIT_QUERY_TIMEOUT:-10}"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -116,6 +118,80 @@ collect_api_instance() {
       "env=\"${env}\",instance_id=\"${instance_id}\""
 
   log "    ✓ API status=$status vol=$(( ${vol_size:-0} / 1073741824 ))GB ha=$ha max_conn=${max_conn:-n/a}"
+}
+
+# ---------------------------------------------------------------------------
+# Cockpit Scaleway : métriques infra de l'instance (CPU, RAM, disk, réseau,
+#                    connexions PG, replication lag)
+#
+# Endpoint : {cockpit_url}/prometheus/api/v1/query
+# Auth     : Authorization: Bearer {cockpit_token}
+# Filtre   : resource_id="{instance_id}" (label natif Scaleway RDB)
+#
+# Les métriques sont récupérées à l'instant présent (instant query).
+# Elles sont ré-exposées dans le Pushgateway avec le préfixe
+# "scaleway_cockpit_rdb_*" pour ne pas écraser les métriques psql.
+# ---------------------------------------------------------------------------
+collect_cockpit_metrics() {
+  local instance_id="$1" env="$2" cockpit_url="$3" cockpit_token="$4"
+  local labels="env=\"${env}\",instance_id=\"${instance_id}\""
+
+  # Métriques RDB exposées nativement par Scaleway dans Cockpit.
+  # Chaque entrée : "nom_metric_cockpit|nom_metric_pushgateway|description"
+  # Le label resource_id filtre sur l'instance concernée.
+  local -a COCKPIT_METRICS=(
+    "rdb_cpu_usage_percent|scaleway_cockpit_rdb_cpu_usage_percent|CPU usage percent of the database instance"
+    "rdb_mem_usage_percent|scaleway_cockpit_rdb_mem_usage_percent|Memory usage percent of the database instance"
+    "rdb_disk_usage_percent|scaleway_cockpit_rdb_disk_usage_percent|Disk usage percent of the database instance"
+    "rdb_disk_iops_read|scaleway_cockpit_rdb_disk_iops_read|Disk read IOPS of the database instance"
+    "rdb_disk_iops_write|scaleway_cockpit_rdb_disk_iops_write|Disk write IOPS of the database instance"
+    "rdb_disk_throughput_read|scaleway_cockpit_rdb_disk_throughput_read_bytes|Disk read throughput in bytes per second"
+    "rdb_disk_throughput_write|scaleway_cockpit_rdb_disk_throughput_write_bytes|Disk write throughput in bytes per second"
+    "rdb_net_rx|scaleway_cockpit_rdb_net_rx_bytes|Network received bytes per second"
+    "rdb_net_tx|scaleway_cockpit_rdb_net_tx_bytes|Network transmitted bytes per second"
+    "rdb_active_connections|scaleway_cockpit_rdb_active_connections|Number of active connections reported by Cockpit"
+    "rdb_replication_lag|scaleway_cockpit_rdb_replication_lag_seconds|Replication lag in seconds (HA / read replicas)"
+  )
+
+  local query_base="${cockpit_url}/prometheus/api/v1/query"
+  local success_count=0
+
+  for entry in "${COCKPIT_METRICS[@]}"; do
+    IFS='|' read -r cockpit_name prom_name description <<< "$entry"
+
+    # Instant query filtrée sur resource_id (label Scaleway natif pour RDB)
+    local query="${cockpit_name}{resource_id=\"${instance_id}\"}"
+    local response
+    response=$(curl -sf \
+      --max-time "${COCKPIT_QUERY_TIMEOUT}" \
+      -H "Authorization: Bearer ${cockpit_token}" \
+      -G "${query_base}" \
+      --data-urlencode "query=${query}" \
+      2>/dev/null || echo "{}")
+
+    # Extraire la valeur du premier résultat (instant vector)
+    local value
+    value=$(echo "$response" | jq -r '
+      .data.result[0].value[1] // empty
+    ' 2>/dev/null || true)
+
+    # Vérifier que la valeur est numérique (entier ou flottant, peut être "NaN")
+    if [[ -n "$value" && "$value" != "NaN" && "$value" =~ ^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+      # Écrire l'en-tête HELP/TYPE une seule fois par métrique (premier scrape)
+      # On préfixe le buffer directement pour éviter les doublons d'en-têtes
+      if ! grep -qF "# HELP ${prom_name} " <<< "$BUFFER" 2>/dev/null; then
+        BUFFER="# HELP ${prom_name} ${description}"$'\n'"# TYPE ${prom_name} gauge"$'\n'"${BUFFER}"
+      fi
+      add_metric "${prom_name}" "${value}" "${labels}"
+      (( success_count++ ))
+    fi
+  done
+
+  if (( success_count > 0 )); then
+    log "    ✓ Cockpit ${success_count}/${#COCKPIT_METRICS[@]} métriques collectées"
+  else
+    warn "    Cockpit aucune métrique récupérée pour ${instance_id} (token Query requis, délai possible)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -290,6 +366,8 @@ write_headers() {
   metric_header "scaleway_db_pg_stmt_avg_exec_ms"          "gauge" "Average execution time in ms (detailed mode)"
   metric_header "scaleway_db_pg_stmt_total_exec_ms"        "gauge" "Total execution time in ms (detailed mode)"
   metric_header "scaleway_db_pg_stmt_avg_rows"             "gauge" "Average rows returned per call (detailed mode)"
+  # Métriques Cockpit — en-têtes écrits dynamiquement dans collect_cockpit_metrics
+  # (uniquement si la métrique est effectivement présente dans Cockpit)
   metric_header "scaleway_db_last_scrape_timestamp"        "gauge" "Unix timestamp of the last successful scrape"
   metric_header "scaleway_db_last_scrape_duration_seconds" "gauge" "Duration of the last scrape in seconds"
 }
@@ -323,14 +401,16 @@ do_scrape() {
   log "=== Scrape démarré — $instance_count instances ==="
 
   for i in $(seq 0 $(( instance_count - 1 ))); do
-    local inst id env host port user pass
+    local inst id env host port user pass cockpit_token cockpit_url
     inst=$(echo "$DB_INSTANCES" | jq -r ".[$i]")
-    id=$(echo   "$inst" | jq -r '.id')
-    env=$(echo  "$inst" | jq -r '.env')
-    host=$(echo "$inst" | jq -r '.host')
-    port=$(echo "$inst" | jq -r '.port')
-    user=$(echo "$inst" | jq -r '.user')
-    pass=$(echo "$inst" | jq -r '.pass')
+    id=$(echo            "$inst" | jq -r '.id')
+    env=$(echo           "$inst" | jq -r '.env')
+    host=$(echo          "$inst" | jq -r '.host')
+    port=$(echo          "$inst" | jq -r '.port')
+    user=$(echo          "$inst" | jq -r '.user')
+    pass=$(echo          "$inst" | jq -r '.pass')
+    cockpit_token=$(echo "$inst" | jq -r '.cockpit_token // empty')
+    cockpit_url=$(echo   "$inst" | jq -r '.cockpit_url   // empty')
 
     log ""
     log "--- $env / $id ($host:$port) ---"
@@ -338,7 +418,15 @@ do_scrape() {
     # 1. Infos statiques via API REST (fonctionne même pour les IPs privées)
     collect_api_instance "$id" "$env"
 
-    # 2. Test connectivité psql + listing des bases
+    # 2. Métriques infra via Cockpit (CPU, RAM, disk, réseau, replication lag)
+    #    Fonctionne même si l'instance est sur réseau privé (pas besoin de psql)
+    if [[ -n "$cockpit_token" && -n "$cockpit_url" ]]; then
+      collect_cockpit_metrics "$id" "$env" "$cockpit_url" "$cockpit_token"
+    else
+      warn "  Cockpit non configuré pour cette instance (cockpit_token / cockpit_url manquants)"
+    fi
+
+    # 3. Test connectivité psql + listing des bases
     export PGHOST="$host" PGPORT="$port" PGUSER="$user" PGPASS="$pass" PGDB="postgres"
 
     local db_list
@@ -354,7 +442,7 @@ do_scrape() {
     local inst_labels="env=\"${env}\",instance_id=\"${id}\""
 
     if [[ "$db_list" == "UNREACHABLE" || -z "$db_list" ]]; then
-      warn "  psql injoignable — skip métriques PG (infos API conservées)"
+      warn "  psql injoignable — skip métriques PG (infos API + Cockpit conservées)"
       add_metric "scaleway_db_instance_mode" "-1" "$inst_labels"
       continue
     fi
@@ -364,7 +452,7 @@ do_scrape() {
     add_metric "scaleway_db_instance_db_count" "$db_count" "$inst_labels"
     log "  → $db_count base(s) utilisateur"
 
-    # 3. Mode agrégé ou détaillé
+    # 4. Mode agrégé ou détaillé
     if (( db_count >= DB_AGGREGATE_THRESHOLD )); then
       add_metric "scaleway_db_instance_mode" "0" "$inst_labels"
       export PGDB="postgres"
@@ -401,6 +489,7 @@ log "Intervalle           : ${SCRAPE_INTERVAL}s"
 log "Seuil mode agrégé    : ${DB_AGGREGATE_THRESHOLD} bases"
 log "Top N (mode agrégé)  : ${DB_TOP_N}"
 log "Timeout connexion    : ${PSQL_CONNECT_TIMEOUT}s"
+log "Timeout Cockpit      : ${COCKPIT_QUERY_TIMEOUT}s"
 log ""
 
 while true; do
