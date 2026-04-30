@@ -221,11 +221,19 @@ scrape() {
 
   start=$(date +%s)
 
-  metric_header "scaleway_db_instance_ready" "gauge" "Instance ready"
-  metric_header "scaleway_db_instance_volume_size_bytes" "gauge" "Volume size"
-  metric_header "scaleway_db_instance_ha" "gauge" "HA"
-  metric_header "scaleway_db_pg_connections_total" "gauge" "Connections"
-  metric_header "scaleway_db_pg_size_bytes" "gauge" "DB size"
+  metric_header "scaleway_db_instance_ready"              "gauge" "Instance ready (1=ok, 0=not ready)"
+  metric_header "scaleway_db_instance_volume_size_bytes"  "gauge" "Volume size in bytes"
+  metric_header "scaleway_db_instance_ha"                 "gauge" "HA enabled (1=yes, 0=no)"
+  metric_header "scaleway_db_instance_max_connections"    "gauge" "Max connections configured on the instance"
+  metric_header "scaleway_db_pg_connections_total"        "gauge" "Total open connections"
+  metric_header "scaleway_db_pg_connections_active"       "gauge" "Active connections (executing a query)"
+  metric_header "scaleway_db_pg_connections_idle"         "gauge" "Idle connections (open but doing nothing)"
+  metric_header "scaleway_db_pg_connections_waiting"      "gauge" "Connections waiting for a lock"
+  metric_header "scaleway_db_pg_max_connections"          "gauge" "Max connections read from PostgreSQL"
+  metric_header "scaleway_db_pg_connections_ratio"        "gauge" "Ratio of used connections vs max (0 to 1)"
+  metric_header "scaleway_db_pg_size_bytes"               "gauge" "Database size in bytes"
+  metric_header "scaleway_db_last_scrape_duration_seconds" "gauge" "Duration of the last scrape in seconds"
+  metric_header "scaleway_db_last_scrape_timestamp"       "gauge" "Unix timestamp of the last scrape"
 
   local count
   count=$(echo "$DB_INSTANCES" | jq 'length')
@@ -236,8 +244,8 @@ scrape() {
     local inst id env host port user pass
 
     inst=$(echo "$DB_INSTANCES" | jq -r ".[$i]")
-    id=$(echo "$inst" | jq -r '.id')
-    env=$(echo "$inst" | jq -r '.env')
+    id=$(echo "$inst"   | jq -r '.id')
+    env=$(echo "$inst"  | jq -r '.env')
     host=$(echo "$inst" | jq -r '.host')
     port=$(echo "$inst" | jq -r '.port')
     user=$(echo "$inst" | jq -r '.user')
@@ -254,7 +262,7 @@ scrape() {
     )
 
     if (( ${#dbs[@]} == 0 )); then
-      warn "psql unreachable"
+      warn "psql unreachable for $env / $id"
       continue
     fi
 
@@ -272,6 +280,7 @@ scrape() {
   duration=$((end - start))
 
   BUFFER+="scaleway_db_last_scrape_duration_seconds $duration"$'\n'
+  BUFFER+="scaleway_db_last_scrape_timestamp $end"$'\n'
 
   push_metrics
   log "Scrape done in ${duration}s"
