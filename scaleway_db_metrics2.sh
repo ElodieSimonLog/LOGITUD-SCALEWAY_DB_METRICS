@@ -173,7 +173,7 @@ collect_cockpit_metrics() {
     local promql="$1"
     local raw
     raw=$(curl -sf --max-time "${COCKPIT_QUERY_TIMEOUT}" \
-      -H "Authorization: Bearer ${cockpit_token}" \
+      -H "X-Token: ${cockpit_token}" \
       -G "${q}" \
       --data-urlencode "query=${promql}" \
       2>/dev/null || echo "{}")
