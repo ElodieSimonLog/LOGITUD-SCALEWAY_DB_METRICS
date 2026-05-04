@@ -136,70 +136,182 @@ collect_api_instance() {
 # ---------------------------------------------------------------------------
 # Cockpit Scaleway : métriques infra de l'instance
 #
-# IMPORTANT : Les noms de métriques exposées par Scaleway dans Cockpit/Mimir
-# pour les instances RDB managées doivent être vérifiés dans votre Cockpit.
-# Pour les découvrir : curl -H "Authorization: Bearer <token>" \
-#   "<cockpit_url>/prometheus/api/v1/label/__name__/values" | jq '.data[]' | grep -i rdb
+# Métriques réelles confirmées sur Scaleway RDB (fr-par) :
+#   rdb_instance_postgresql_node_cpu_seconds_total      (counter, labels: mode)
+#   rdb_instance_postgresql_node_disk_read_bytes_total  (counter)
+#   rdb_instance_postgresql_node_disk_written_bytes_total (counter)
+#   rdb_instance_postgresql_node_disk_reads_completed_total  (counter)
+#   rdb_instance_postgresql_node_disk_writes_completed_total (counter)
+#   rdb_instance_postgresql_node_filesystem_avail_bytes (gauge)
+#   rdb_instance_postgresql_node_filesystem_size_bytes  (gauge)
+#   rdb_instance_postgresql_node_memory_MemAvailable_bytes (gauge)
+#   rdb_instance_postgresql_node_memory_MemTotal_bytes  (gauge)
+#   rdb_instance_postgresql_pg_replication_lag          (gauge)
+#   rdb_instance_postgresql_pg_settings_max_connections (gauge)
+#   rdb_instance_postgresql_pg_stat_activity_count      (gauge)
+#   rdb_instance_postgresql_pg_stat_database_numbackends (gauge)
 #
-# Les noms ci-dessous sont les noms les plus courants observés sur Scaleway RDB.
-# Adaptez-les si vos métriques ont un préfixe différent (ex: postgresql_*).
+# CPU : compteur cumulatif → on utilise irate(...[2m]) pour avoir un taux.
+#   CPU% = 1 - irate(cpu_seconds_total{mode="idle"}[2m])
+#   (somme sur tous les cœurs, normalisée entre 0 et 1)
+#
+# RAM : (MemTotal - MemAvailable) / MemTotal → ratio 0-1
+#
+# Disque % : (size - avail) / size → ratio 0-1
+# Disque I/O : irate sur les compteurs read/write bytes et IOPS
+#
+# Le label de filtrage Scaleway RDB est "resource_id".
 # ---------------------------------------------------------------------------
 collect_cockpit_metrics() {
   local instance_id="$1" env="$2" cockpit_url="$3" cockpit_token="$4"
   local labels="env=\"${env}\",instance_id=\"${instance_id}\""
-
-  # Format : "nom_cockpit|nom_pushgateway|type|description"
-  # Listez ici les métriques réellement disponibles dans votre Cockpit.
-  # Pour les découvrir : voir commentaire ci-dessus.
-  local -a COCKPIT_METRICS=(
-    "rdb_cpu_usage_percent|scaleway_cockpit_rdb_cpu_usage_percent|gauge|CPU usage percent of the database instance"
-    "rdb_mem_usage_percent|scaleway_cockpit_rdb_mem_usage_percent|gauge|Memory usage percent of the database instance"
-    "rdb_disk_usage_percent|scaleway_cockpit_rdb_disk_usage_percent|gauge|Disk usage percent of the database instance"
-    "rdb_disk_iops_read|scaleway_cockpit_rdb_disk_iops_read|gauge|Disk read IOPS of the database instance"
-    "rdb_disk_iops_write|scaleway_cockpit_rdb_disk_iops_write|gauge|Disk write IOPS of the database instance"
-    "rdb_disk_throughput_read|scaleway_cockpit_rdb_disk_throughput_read_bytes|gauge|Disk read throughput in bytes per second"
-    "rdb_disk_throughput_write|scaleway_cockpit_rdb_disk_throughput_write_bytes|gauge|Disk write throughput in bytes per second"
-    "rdb_net_rx|scaleway_cockpit_rdb_net_rx_bytes|gauge|Network received bytes per second"
-    "rdb_net_tx|scaleway_cockpit_rdb_net_tx_bytes|gauge|Network transmitted bytes per second"
-    "rdb_active_connections|scaleway_cockpit_rdb_active_connections|gauge|Number of active connections reported by Cockpit"
-    "rdb_replication_lag|scaleway_cockpit_rdb_replication_lag_seconds|gauge|Replication lag in seconds (HA / read replicas)"
-  )
-
-  # Label de filtrage — Scaleway utilise resource_id OU instance_id selon la version du Cockpit.
-  # Essayez les deux si aucune métrique ne remonte.
-  local filter_label="resource_id"
-  local query_base="${cockpit_url}/prometheus/api/v1/query"
+  local q="${cockpit_url}/prometheus/api/v1/query"
   local success_count=0
 
-  for entry in "${COCKPIT_METRICS[@]}"; do
-    IFS='|' read -r cockpit_name prom_name prom_type description <<< "$entry"
-
-    local query="${cockpit_name}{${filter_label}=\"${instance_id}\"}"
-    local response
-    response=$(curl -sf \
-      --max-time "${COCKPIT_QUERY_TIMEOUT}" \
+  # Fonction interne : exécute une PromQL instant query, retourne la valeur scalaire ou ""
+  cockpit_query() {
+    local promql="$1"
+    local raw
+    raw=$(curl -sf --max-time "${COCKPIT_QUERY_TIMEOUT}" \
       -H "Authorization: Bearer ${cockpit_token}" \
-      -G "${query_base}" \
-      --data-urlencode "query=${query}" \
+      -G "${q}" \
+      --data-urlencode "query=${promql}" \
       2>/dev/null || echo "{}")
+    # Instant vector → premier résultat → valeur
+    local val
+    val=$(echo "$raw" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null || true)
+    # Rejette NaN, Inf, vide, non-numérique
+    if [[ -n "$val" && "$val" != "NaN" && "$val" != "+Inf" && "$val" != "-Inf" \
+          && "$val" =~ ^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+      echo "$val"
+    fi
+  }
 
-    local value
-    value=$(echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null || true)
+  # Filtre de base pour cet instance
+  local f="resource_id=\"${instance_id}\""
 
-    if [[ -n "$value" && "$value" != "NaN" && "$value" =~ ^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
-      metric_header "${prom_name}" "${prom_type}" "${description}"
-      add_metric "${prom_name}" "${value}" "${labels}"
+  # ------- CPU -------
+  # irate sur 2 min, somme tous les modes sauf idle → % CPU utilisé (0-100)
+  # On prend irate idle / irate total pour être robuste au nombre de cœurs.
+  local cpu_val
+  cpu_val=$(cockpit_query "
+    (1 - sum(irate(rdb_instance_postgresql_node_cpu_seconds_total{${f},mode=\"idle\"}[2m]))
+       / sum(irate(rdb_instance_postgresql_node_cpu_seconds_total{${f}}[2m]))) * 100
+  ")
+  if [[ -n "$cpu_val" ]]; then
+    metric_header "scaleway_cockpit_rdb_cpu_usage_percent" "gauge" "CPU usage percent (all cores, via irate 2m)"
+    add_metric "scaleway_cockpit_rdb_cpu_usage_percent" "$cpu_val" "$labels"
+    success_count=$(( success_count + 1 ))
+    log "    ✓ CPU ${cpu_val}%"
+  fi
+
+  # ------- RAM -------
+  # (MemTotal - MemAvailable) / MemTotal * 100  → % RAM utilisée
+  local mem_total mem_avail
+  mem_total=$(cockpit_query "rdb_instance_postgresql_node_memory_MemTotal_bytes{${f}}")
+  mem_avail=$(cockpit_query "rdb_instance_postgresql_node_memory_MemAvailable_bytes{${f}}")
+  if [[ -n "$mem_total" && -n "$mem_avail" ]]; then
+    metric_header "scaleway_cockpit_rdb_mem_total_bytes"    "gauge" "Total memory of the database instance in bytes"
+    metric_header "scaleway_cockpit_rdb_mem_available_bytes" "gauge" "Available memory of the database instance in bytes"
+    metric_header "scaleway_cockpit_rdb_mem_usage_percent"  "gauge" "Memory usage percent of the database instance"
+    add_metric "scaleway_cockpit_rdb_mem_total_bytes"    "$mem_total" "$labels"
+    add_metric "scaleway_cockpit_rdb_mem_available_bytes" "$mem_avail" "$labels"
+    local mem_pct
+    mem_pct=$(awk "BEGIN { printf \"%.2f\", (${mem_total} - ${mem_avail}) / ${mem_total} * 100 }")
+    add_metric "scaleway_cockpit_rdb_mem_usage_percent" "$mem_pct" "$labels"
+    success_count=$(( success_count + 3 ))
+    log "    ✓ RAM ${mem_pct}% (total=$(( mem_total / 1073741824 ))GB avail=$(( mem_avail / 1073741824 ))GB)"
+  fi
+
+  # ------- Disque % utilisé -------
+  # On prend le filesystem principal (mountpoint="/"). S'il y en a plusieurs,
+  # on prend le plus grand (ORDER BY size DESC LIMIT 1 côté PromQL = max()).
+  local disk_size disk_avail
+  disk_size=$(cockpit_query "max(rdb_instance_postgresql_node_filesystem_size_bytes{${f}})")
+  disk_avail=$(cockpit_query "max(rdb_instance_postgresql_node_filesystem_avail_bytes{${f}})")
+  if [[ -n "$disk_size" && -n "$disk_avail" && "$disk_size" != "0" ]]; then
+    metric_header "scaleway_cockpit_rdb_disk_size_bytes"    "gauge" "Total filesystem size of the database instance in bytes"
+    metric_header "scaleway_cockpit_rdb_disk_avail_bytes"   "gauge" "Available filesystem space of the database instance in bytes"
+    metric_header "scaleway_cockpit_rdb_disk_usage_percent" "gauge" "Disk usage percent of the database instance"
+    add_metric "scaleway_cockpit_rdb_disk_size_bytes"  "$disk_size"  "$labels"
+    add_metric "scaleway_cockpit_rdb_disk_avail_bytes" "$disk_avail" "$labels"
+    local disk_pct
+    disk_pct=$(awk "BEGIN { printf \"%.2f\", (${disk_size} - ${disk_avail}) / ${disk_size} * 100 }")
+    add_metric "scaleway_cockpit_rdb_disk_usage_percent" "$disk_pct" "$labels"
+    success_count=$(( success_count + 3 ))
+    log "    ✓ Disque ${disk_pct}% (total=$(( disk_size / 1073741824 ))GB avail=$(( disk_avail / 1073741824 ))GB)"
+  fi
+
+  # ------- I/O disque (débit et IOPS via irate 2m) -------
+  local disk_read_bps disk_write_bps disk_read_iops disk_write_iops
+  disk_read_bps=$(cockpit_query   "irate(rdb_instance_postgresql_node_disk_read_bytes_total{${f}}[2m])")
+  disk_write_bps=$(cockpit_query  "irate(rdb_instance_postgresql_node_disk_written_bytes_total{${f}}[2m])")
+  disk_read_iops=$(cockpit_query  "irate(rdb_instance_postgresql_node_disk_reads_completed_total{${f}}[2m])")
+  disk_write_iops=$(cockpit_query "irate(rdb_instance_postgresql_node_disk_writes_completed_total{${f}}[2m])")
+  if [[ -n "$disk_read_bps" ]]; then
+    metric_header "scaleway_cockpit_rdb_disk_read_bytes_per_second"  "gauge" "Disk read throughput in bytes/s (irate 2m)"
+    add_metric "scaleway_cockpit_rdb_disk_read_bytes_per_second"  "$disk_read_bps"  "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+  if [[ -n "$disk_write_bps" ]]; then
+    metric_header "scaleway_cockpit_rdb_disk_write_bytes_per_second" "gauge" "Disk write throughput in bytes/s (irate 2m)"
+    add_metric "scaleway_cockpit_rdb_disk_write_bytes_per_second" "$disk_write_bps" "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+  if [[ -n "$disk_read_iops" ]]; then
+    metric_header "scaleway_cockpit_rdb_disk_read_iops"  "gauge" "Disk read IOPS (irate 2m)"
+    add_metric "scaleway_cockpit_rdb_disk_read_iops"  "$disk_read_iops"  "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+  if [[ -n "$disk_write_iops" ]]; then
+    metric_header "scaleway_cockpit_rdb_disk_write_iops" "gauge" "Disk write IOPS (irate 2m)"
+    add_metric "scaleway_cockpit_rdb_disk_write_iops" "$disk_write_iops" "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+
+  # ------- Connexions PG (vue Cockpit) -------
+  local pg_conns pg_backends pg_max_conn_cockpit
+  pg_conns=$(cockpit_query         "rdb_instance_postgresql_pg_stat_activity_count{${f}}")
+  pg_backends=$(cockpit_query      "sum(rdb_instance_postgresql_pg_stat_database_numbackends{${f}})")
+  pg_max_conn_cockpit=$(cockpit_query "rdb_instance_postgresql_pg_settings_max_connections{${f}}")
+  if [[ -n "$pg_conns" ]]; then
+    metric_header "scaleway_cockpit_rdb_pg_stat_activity_count" "gauge" "Active connections from pg_stat_activity (Cockpit)"
+    add_metric "scaleway_cockpit_rdb_pg_stat_activity_count" "$pg_conns" "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+  if [[ -n "$pg_backends" ]]; then
+    metric_header "scaleway_cockpit_rdb_pg_stat_database_numbackends" "gauge" "Total backends from pg_stat_database (Cockpit)"
+    add_metric "scaleway_cockpit_rdb_pg_stat_database_numbackends" "$pg_backends" "$labels"
+    success_count=$(( success_count + 1 ))
+  fi
+  if [[ -n "$pg_max_conn_cockpit" ]]; then
+    metric_header "scaleway_cockpit_rdb_pg_settings_max_connections" "gauge" "max_connections setting from Cockpit"
+    add_metric "scaleway_cockpit_rdb_pg_settings_max_connections" "$pg_max_conn_cockpit" "$labels"
+    success_count=$(( success_count + 1 ))
+    # Ratio connexions/max via données Cockpit (indépendant de psql)
+    if [[ -n "$pg_conns" && "$pg_max_conn_cockpit" != "0" ]]; then
+      local conn_ratio_cockpit
+      conn_ratio_cockpit=$(awk "BEGIN { printf \"%.4f\", ${pg_conns} / ${pg_max_conn_cockpit} }")
+      metric_header "scaleway_cockpit_rdb_pg_connections_ratio" "gauge" "Ratio active connections / max_connections (Cockpit)"
+      add_metric "scaleway_cockpit_rdb_pg_connections_ratio" "$conn_ratio_cockpit" "$labels"
       success_count=$(( success_count + 1 ))
     fi
-  done
+  fi
+
+  # ------- Replication lag -------
+  local repl_lag
+  repl_lag=$(cockpit_query "rdb_instance_postgresql_pg_replication_lag{${f}}")
+  if [[ -n "$repl_lag" ]]; then
+    metric_header "scaleway_cockpit_rdb_replication_lag_seconds" "gauge" "Replication lag in seconds (Cockpit)"
+    add_metric "scaleway_cockpit_rdb_replication_lag_seconds" "$repl_lag" "$labels"
+    success_count=$(( success_count + 1 ))
+    log "    ✓ Replication lag ${repl_lag}s"
+  fi
 
   if (( success_count > 0 )); then
-    log "    ✓ Cockpit ${success_count}/${#COCKPIT_METRICS[@]} métriques collectées"
+    log "    ✓ Cockpit ${success_count} métriques collectées"
   else
-    warn "    Cockpit : aucune métrique pour ${instance_id}."
-    warn "    → Vérifiez cockpit_url, cockpit_token (rôle Query requis), et les noms de métriques."
-    warn "    → Pour lister les métriques disponibles :"
-    warn "       curl -H 'Authorization: Bearer <token>' '${cockpit_url}/prometheus/api/v1/label/__name__/values'"
+    warn "    Cockpit : aucune métrique pour ${instance_id} — vérifiez le token (rôle Query) et le resource_id"
   fi
 }
 
