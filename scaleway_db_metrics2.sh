@@ -2,7 +2,7 @@
 # =============================================================================
 # scaleway_db_metrics.sh
 #
-# Collecte toutes les 5 min les métriques des bases PostgreSQL Scaleway
+# Collecte toutes les N secondes les métriques des bases PostgreSQL Scaleway
 # et les pousse vers un Prometheus Pushgateway.
 #
 # Sources de données :
@@ -24,7 +24,7 @@
 #
 # Port-forward Pushgateway :
 #   kubectl port-forward svc/<pushgateway-svc> 9091:9091 -n grafana
-# =============================================================================
+# ==============================================================================
 
 set -euo pipefail
 
@@ -65,8 +65,21 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2; }
 # Buffer Prometheus
 # ---------------------------------------------------------------------------
 BUFFER=""
-metric_header() { BUFFER+="# HELP $1 $3"$'\n'"# TYPE $1 $2"$'\n'; }
-add_metric()    { BUFFER+="$1{$3} $2"$'\n'; }
+declare -A HEADERS_WRITTEN=()
+
+metric_header() {
+  local name="$1" type="$2" help="$3"
+  # N'écrit l'en-tête qu'une seule fois par nom de métrique
+  if [[ -z "${HEADERS_WRITTEN[$name]:-}" ]]; then
+    BUFFER+="# HELP ${name} ${help}"$'\n'"# TYPE ${name} ${type}"$'\n'
+    HEADERS_WRITTEN[$name]=1
+  fi
+}
+
+add_metric() {
+  local name="$1" value="$2" labels="$3"
+  BUFFER+="${name}{${labels}} ${value}"$'\n'
+}
 
 # ---------------------------------------------------------------------------
 # Wrapper psql (utilise les variables PGHOST/PGPORT/PGUSER/PGPASS/PGDB)
@@ -121,46 +134,47 @@ collect_api_instance() {
 }
 
 # ---------------------------------------------------------------------------
-# Cockpit Scaleway : métriques infra de l'instance (CPU, RAM, disk, réseau,
-#                    connexions PG, replication lag)
+# Cockpit Scaleway : métriques infra de l'instance
 #
-# Endpoint : {cockpit_url}/prometheus/api/v1/query
-# Auth     : Authorization: Bearer {cockpit_token}
-# Filtre   : resource_id="{instance_id}" (label natif Scaleway RDB)
+# IMPORTANT : Les noms de métriques exposées par Scaleway dans Cockpit/Mimir
+# pour les instances RDB managées doivent être vérifiés dans votre Cockpit.
+# Pour les découvrir : curl -H "Authorization: Bearer <token>" \
+#   "<cockpit_url>/prometheus/api/v1/label/__name__/values" | jq '.data[]' | grep -i rdb
 #
-# Les métriques sont récupérées à l'instant présent (instant query).
-# Elles sont ré-exposées dans le Pushgateway avec le préfixe
-# "scaleway_cockpit_rdb_*" pour ne pas écraser les métriques psql.
+# Les noms ci-dessous sont les noms les plus courants observés sur Scaleway RDB.
+# Adaptez-les si vos métriques ont un préfixe différent (ex: postgresql_*).
 # ---------------------------------------------------------------------------
 collect_cockpit_metrics() {
   local instance_id="$1" env="$2" cockpit_url="$3" cockpit_token="$4"
   local labels="env=\"${env}\",instance_id=\"${instance_id}\""
 
-  # Métriques RDB exposées nativement par Scaleway dans Cockpit.
-  # Chaque entrée : "nom_metric_cockpit|nom_metric_pushgateway|description"
-  # Le label resource_id filtre sur l'instance concernée.
+  # Format : "nom_cockpit|nom_pushgateway|type|description"
+  # Listez ici les métriques réellement disponibles dans votre Cockpit.
+  # Pour les découvrir : voir commentaire ci-dessus.
   local -a COCKPIT_METRICS=(
-    "rdb_cpu_usage_percent|scaleway_cockpit_rdb_cpu_usage_percent|CPU usage percent of the database instance"
-    "rdb_mem_usage_percent|scaleway_cockpit_rdb_mem_usage_percent|Memory usage percent of the database instance"
-    "rdb_disk_usage_percent|scaleway_cockpit_rdb_disk_usage_percent|Disk usage percent of the database instance"
-    "rdb_disk_iops_read|scaleway_cockpit_rdb_disk_iops_read|Disk read IOPS of the database instance"
-    "rdb_disk_iops_write|scaleway_cockpit_rdb_disk_iops_write|Disk write IOPS of the database instance"
-    "rdb_disk_throughput_read|scaleway_cockpit_rdb_disk_throughput_read_bytes|Disk read throughput in bytes per second"
-    "rdb_disk_throughput_write|scaleway_cockpit_rdb_disk_throughput_write_bytes|Disk write throughput in bytes per second"
-    "rdb_net_rx|scaleway_cockpit_rdb_net_rx_bytes|Network received bytes per second"
-    "rdb_net_tx|scaleway_cockpit_rdb_net_tx_bytes|Network transmitted bytes per second"
-    "rdb_active_connections|scaleway_cockpit_rdb_active_connections|Number of active connections reported by Cockpit"
-    "rdb_replication_lag|scaleway_cockpit_rdb_replication_lag_seconds|Replication lag in seconds (HA / read replicas)"
+    "rdb_cpu_usage_percent|scaleway_cockpit_rdb_cpu_usage_percent|gauge|CPU usage percent of the database instance"
+    "rdb_mem_usage_percent|scaleway_cockpit_rdb_mem_usage_percent|gauge|Memory usage percent of the database instance"
+    "rdb_disk_usage_percent|scaleway_cockpit_rdb_disk_usage_percent|gauge|Disk usage percent of the database instance"
+    "rdb_disk_iops_read|scaleway_cockpit_rdb_disk_iops_read|gauge|Disk read IOPS of the database instance"
+    "rdb_disk_iops_write|scaleway_cockpit_rdb_disk_iops_write|gauge|Disk write IOPS of the database instance"
+    "rdb_disk_throughput_read|scaleway_cockpit_rdb_disk_throughput_read_bytes|gauge|Disk read throughput in bytes per second"
+    "rdb_disk_throughput_write|scaleway_cockpit_rdb_disk_throughput_write_bytes|gauge|Disk write throughput in bytes per second"
+    "rdb_net_rx|scaleway_cockpit_rdb_net_rx_bytes|gauge|Network received bytes per second"
+    "rdb_net_tx|scaleway_cockpit_rdb_net_tx_bytes|gauge|Network transmitted bytes per second"
+    "rdb_active_connections|scaleway_cockpit_rdb_active_connections|gauge|Number of active connections reported by Cockpit"
+    "rdb_replication_lag|scaleway_cockpit_rdb_replication_lag_seconds|gauge|Replication lag in seconds (HA / read replicas)"
   )
 
+  # Label de filtrage — Scaleway utilise resource_id OU instance_id selon la version du Cockpit.
+  # Essayez les deux si aucune métrique ne remonte.
+  local filter_label="resource_id"
   local query_base="${cockpit_url}/prometheus/api/v1/query"
   local success_count=0
 
   for entry in "${COCKPIT_METRICS[@]}"; do
-    IFS='|' read -r cockpit_name prom_name description <<< "$entry"
+    IFS='|' read -r cockpit_name prom_name prom_type description <<< "$entry"
 
-    # Instant query filtrée sur resource_id (label Scaleway natif pour RDB)
-    local query="${cockpit_name}{resource_id=\"${instance_id}\"}"
+    local query="${cockpit_name}{${filter_label}=\"${instance_id}\"}"
     local response
     response=$(curl -sf \
       --max-time "${COCKPIT_QUERY_TIMEOUT}" \
@@ -169,28 +183,23 @@ collect_cockpit_metrics() {
       --data-urlencode "query=${query}" \
       2>/dev/null || echo "{}")
 
-    # Extraire la valeur du premier résultat (instant vector)
     local value
-    value=$(echo "$response" | jq -r '
-      .data.result[0].value[1] // empty
-    ' 2>/dev/null || true)
+    value=$(echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null || true)
 
-    # Vérifier que la valeur est numérique (entier ou flottant, peut être "NaN")
     if [[ -n "$value" && "$value" != "NaN" && "$value" =~ ^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
-      # Écrire l'en-tête HELP/TYPE une seule fois par métrique (premier scrape)
-      # On préfixe le buffer directement pour éviter les doublons d'en-têtes
-      if ! grep -qF "# HELP ${prom_name} " <<< "$BUFFER" 2>/dev/null; then
-        BUFFER="# HELP ${prom_name} ${description}"$'\n'"# TYPE ${prom_name} gauge"$'\n'"${BUFFER}"
-      fi
+      metric_header "${prom_name}" "${prom_type}" "${description}"
       add_metric "${prom_name}" "${value}" "${labels}"
-      (( success_count++ ))
+      success_count=$(( success_count + 1 ))
     fi
   done
 
   if (( success_count > 0 )); then
     log "    ✓ Cockpit ${success_count}/${#COCKPIT_METRICS[@]} métriques collectées"
   else
-    warn "    Cockpit aucune métrique récupérée pour ${instance_id} (token Query requis, délai possible)"
+    warn "    Cockpit : aucune métrique pour ${instance_id}."
+    warn "    → Vérifiez cockpit_url, cockpit_token (rôle Query requis), et les noms de métriques."
+    warn "    → Pour lister les métriques disponibles :"
+    warn "       curl -H 'Authorization: Bearer <token>' '${cockpit_url}/prometheus/api/v1/label/__name__/values'"
   fi
 }
 
@@ -214,6 +223,7 @@ collect_aggregated() {
     WHERE datname NOT IN ('postgres','rdb','') AND datname IS NOT NULL;
   ")
 
+  local total=0 active=0 idle=0 waiting=0
   if [[ -n "$conn_data" ]]; then
     IFS='|' read -r total active idle waiting <<< "$conn_data"
     [[ "$total"   =~ ^[0-9]+$ ]] && add_metric "scaleway_db_pg_connections_total"   "$total"   "$inst_labels"
@@ -223,13 +233,14 @@ collect_aggregated() {
     log "    ✓ connexions total=$total active=$active idle=$idle waiting=$waiting"
   fi
 
-  # Ratio connexions / max (max_connections vient de l'API, déjà dans le buffer)
+  # Ratio connexions / max
   local max_conn
   max_conn=$(pg -t -A -c "SELECT setting FROM pg_settings WHERE name='max_connections';")
-  if [[ "$max_conn" =~ ^[0-9]+$ && "${total:-0}" =~ ^[0-9]+$ && "$max_conn" -gt 0 ]]; then
+  if [[ "$max_conn" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$max_conn" -gt 0 ]]; then
     local ratio
-    ratio=$(awk "BEGIN { printf \"%.4f\", ${total:-0} / $max_conn }")
-    add_metric "scaleway_db_pg_connections_ratio" "$ratio" "$inst_labels"
+    ratio=$(awk "BEGIN { printf \"%.4f\", ${total} / ${max_conn} }")
+    add_metric "scaleway_db_pg_connections_ratio"       "$ratio"    "$inst_labels"
+    add_metric "scaleway_db_pg_max_connections"         "$max_conn" "$inst_labels"
   fi
 
   # Top N bases par taille
@@ -271,6 +282,45 @@ collect_aggregated() {
           "env=\"${env}\",instance_id=\"${instance_id}\",db=\"${dbname}\""
     done <<< "$conn_rows"
     log "    ✓ top ${DB_TOP_N} connexions par base collectées"
+  fi
+
+  # ------------------------------------------------------------------
+  # Requêtes lentes en mode agrégé : on interroge pg_stat_statements
+  # sur toutes les BDD, groupé par queryid (sans connexion par BDD).
+  # On expose le top N par total_exec_time au niveau instance.
+  # ------------------------------------------------------------------
+  local ext_ok
+  ext_ok=$(pg -t -A -c "SELECT COUNT(*) FROM pg_extension WHERE extname='pg_stat_statements';")
+  if [[ "${ext_ok:-0}" == "1" ]]; then
+    local stmts
+    stmts=$(pg -t -A -F '§' -c "
+      SELECT
+        queryid,
+        calls,
+        ROUND((total_exec_time / NULLIF(calls,0))::numeric, 3)  AS avg_ms,
+        ROUND(total_exec_time::numeric, 3)                       AS total_ms,
+        ROUND(max_exec_time::numeric, 3)                         AS max_ms,
+        ROUND(rows::numeric / NULLIF(calls,0), 2)                AS avg_rows
+      FROM pg_stat_statements
+      ORDER BY total_exec_time DESC
+      LIMIT ${DB_TOP_N};
+    ")
+    if [[ -n "$stmts" ]]; then
+      local rank=1
+      while IFS='§' read -r queryid calls avg_ms total_ms max_ms avg_rows; do
+        [[ -z "$queryid" ]] && continue
+        local sl="${inst_labels},queryid=\"${queryid}\",rank=\"${rank}\""
+        [[ "$calls"    =~ ^[0-9]+$             ]] && add_metric "scaleway_db_pg_stmt_calls_total"   "$calls"    "$sl"
+        [[ "$avg_ms"   =~ ^[0-9]+(\.[0-9]+)?$  ]] && add_metric "scaleway_db_pg_stmt_avg_exec_ms"   "$avg_ms"   "$sl"
+        [[ "$total_ms" =~ ^[0-9]+(\.[0-9]+)?$  ]] && add_metric "scaleway_db_pg_stmt_total_exec_ms" "$total_ms" "$sl"
+        [[ "$max_ms"   =~ ^[0-9]+(\.[0-9]+)?$  ]] && add_metric "scaleway_db_pg_stmt_max_exec_ms"   "$max_ms"   "$sl"
+        [[ "$avg_rows" =~ ^[0-9]+(\.[0-9]+)?$  ]] && add_metric "scaleway_db_pg_stmt_avg_rows"      "$avg_rows" "$sl"
+        rank=$(( rank + 1 ))
+      done <<< "$stmts"
+      log "    ✓ pg_stat_statements top ${DB_TOP_N} (mode agrégé)"
+    fi
+  else
+    warn "    pg_stat_statements non installée sur cette instance"
   fi
 }
 
@@ -320,9 +370,10 @@ collect_detailed() {
       SELECT
         queryid,
         calls,
-        ROUND((total_exec_time / NULLIF(calls,0))::numeric, 3),
-        ROUND(total_exec_time::numeric, 3),
-        ROUND(rows::numeric / NULLIF(calls,0), 2)
+        ROUND((total_exec_time / NULLIF(calls,0))::numeric, 3)  AS avg_ms,
+        ROUND(total_exec_time::numeric, 3)                       AS total_ms,
+        ROUND(max_exec_time::numeric, 3)                         AS max_ms,
+        ROUND(rows::numeric / NULLIF(calls,0), 2)                AS avg_rows
       FROM pg_stat_statements
       WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
       ORDER BY total_exec_time DESC
@@ -330,17 +381,20 @@ collect_detailed() {
     ")
     if [[ -n "$stmts" ]]; then
       local rank=1
-      while IFS='§' read -r queryid calls avg_ms total_ms avg_rows; do
+      while IFS='§' read -r queryid calls avg_ms total_ms max_ms avg_rows; do
         [[ -z "$queryid" ]] && continue
         local sl="${labels},queryid=\"${queryid}\",rank=\"${rank}\""
         [[ "$calls"    =~ ^[0-9]+$            ]] && add_metric "scaleway_db_pg_stmt_calls_total"   "$calls"    "$sl"
         [[ "$avg_ms"   =~ ^[0-9]+(\.[0-9]+)?$ ]] && add_metric "scaleway_db_pg_stmt_avg_exec_ms"   "$avg_ms"   "$sl"
         [[ "$total_ms" =~ ^[0-9]+(\.[0-9]+)?$ ]] && add_metric "scaleway_db_pg_stmt_total_exec_ms" "$total_ms" "$sl"
+        [[ "$max_ms"   =~ ^[0-9]+(\.[0-9]+)?$ ]] && add_metric "scaleway_db_pg_stmt_max_exec_ms"   "$max_ms"   "$sl"
         [[ "$avg_rows" =~ ^[0-9]+(\.[0-9]+)?$ ]] && add_metric "scaleway_db_pg_stmt_avg_rows"      "$avg_rows" "$sl"
-        (( rank++ ))
+        rank=$(( rank + 1 ))
       done <<< "$stmts"
       log "      ✓ pg_stat_statements top 10"
     fi
+  else
+    warn "      pg_stat_statements non installée sur ${db}"
   fi
 }
 
@@ -360,14 +414,13 @@ write_headers() {
   metric_header "scaleway_db_pg_connections_idle"          "gauge" "Idle connections"
   metric_header "scaleway_db_pg_connections_waiting"       "gauge" "Connections waiting on a lock"
   metric_header "scaleway_db_pg_connections_per_db"        "gauge" "Connections per database (aggregated mode, top N)"
-  metric_header "scaleway_db_pg_max_connections"           "gauge" "max_connections PostgreSQL setting (detailed mode)"
+  metric_header "scaleway_db_pg_max_connections"           "gauge" "max_connections PostgreSQL setting"
   metric_header "scaleway_db_pg_connections_ratio"         "gauge" "Ratio used connections / max_connections (0-1)"
-  metric_header "scaleway_db_pg_stmt_calls_total"          "gauge" "Total call count for a tracked statement (detailed mode)"
-  metric_header "scaleway_db_pg_stmt_avg_exec_ms"          "gauge" "Average execution time in ms (detailed mode)"
-  metric_header "scaleway_db_pg_stmt_total_exec_ms"        "gauge" "Total execution time in ms (detailed mode)"
-  metric_header "scaleway_db_pg_stmt_avg_rows"             "gauge" "Average rows returned per call (detailed mode)"
-  # Métriques Cockpit — en-têtes écrits dynamiquement dans collect_cockpit_metrics
-  # (uniquement si la métrique est effectivement présente dans Cockpit)
+  metric_header "scaleway_db_pg_stmt_calls_total"          "gauge" "Total call count for a tracked statement"
+  metric_header "scaleway_db_pg_stmt_avg_exec_ms"          "gauge" "Average execution time in ms"
+  metric_header "scaleway_db_pg_stmt_total_exec_ms"        "gauge" "Total execution time in ms"
+  metric_header "scaleway_db_pg_stmt_max_exec_ms"          "gauge" "Max (worst) execution time ever recorded in ms"
+  metric_header "scaleway_db_pg_stmt_avg_rows"             "gauge" "Average rows returned per call"
   metric_header "scaleway_db_last_scrape_timestamp"        "gauge" "Unix timestamp of the last successful scrape"
   metric_header "scaleway_db_last_scrape_duration_seconds" "gauge" "Duration of the last scrape in seconds"
 }
@@ -394,6 +447,7 @@ push_to_gateway() {
 do_scrape() {
   local t_start; t_start=$(date +%s)
   BUFFER=""
+  declare -gA HEADERS_WRITTEN=()   # reset pour chaque scrape
   write_headers
 
   local instance_count
@@ -415,11 +469,10 @@ do_scrape() {
     log ""
     log "--- $env / $id ($host:$port) ---"
 
-    # 1. Infos statiques via API REST (fonctionne même pour les IPs privées)
+    # 1. Infos statiques via API REST
     collect_api_instance "$id" "$env"
 
     # 2. Métriques infra via Cockpit (CPU, RAM, disk, réseau, replication lag)
-    #    Fonctionne même si l'instance est sur réseau privé (pas besoin de psql)
     if [[ -n "$cockpit_token" && -n "$cockpit_url" ]]; then
       collect_cockpit_metrics "$id" "$env" "$cockpit_url" "$cockpit_token"
     else
