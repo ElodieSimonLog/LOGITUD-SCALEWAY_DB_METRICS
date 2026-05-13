@@ -41,7 +41,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
+from urllib.parse import urlencode
 import urllib.request
 import urllib.error
 
@@ -114,14 +114,11 @@ def _inject_label(line: str, label_kv: str) -> str:
 
 
 def scrape_project(project: dict) -> tuple[str, str | None, float]:
-    """
-    Scrape le endpoint /metrics d'un projet Cockpit.
-    Retourne (project_name, metrics_text_or_None, duration_seconds).
-    """
     name  = project["name"]
-    url = project["url"].rstrip("/") + '/federate?match[]={__name__=~".+"}'
+    base  = project["url"].rstrip("/") + "/federate"
+    query = urlencode({"match[]": '{__name__=~".+"}'})
+    url   = f"{base}?{query}"
     token = project["token"]
-    label = f'scaleway_project="{name}"'
 
     t0 = time.monotonic()
     req = urllib.request.Request(url, headers={"X-Token": token})
