@@ -119,7 +119,7 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
     Retourne (project_name, metrics_text_or_None, duration_seconds).
     """
     name  = project["name"]
-    url   = project["url"].rstrip("/") + "/metrics"
+    url = project["url"].rstrip("/") + '/federate?match[]={__name__=~".+"}'
     token = project["token"]
     label = f'scaleway_project="{name}"'
 
