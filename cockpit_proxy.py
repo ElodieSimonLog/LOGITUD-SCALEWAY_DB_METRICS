@@ -210,18 +210,36 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 # ---------------------------------------------------------------------------
 
 def push_to_gateway(job: str, instance: str, data: str) -> bool:
-    """Pousse les métriques vers le Pushgateway via PUT /metrics/job/<job>/instance/<instance>."""
-    url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
+    """
+    Pousse les métriques vers le Pushgateway.
+    Effectue un DELETE préalable pour éviter les conflits de labelsets
+    entre cycles (métriques périmées ou labelsets changeants).
+    """
+    base_url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
+
+    # 1. DELETE — vide le groupe pour repartir d'un état propre
+    try:
+        del_req = urllib.request.Request(base_url, method="DELETE")
+        with urllib.request.urlopen(del_req, timeout=10) as resp:
+            log.debug("DELETE OK [%s] : HTTP %s", instance, resp.status)
+    except urllib.error.HTTPError as e:
+        # 404 = groupe inexistant, pas un problème
+        if e.code != 404:
+            log.warning("DELETE [%s] HTTP %s (non bloquant)", instance, e.code)
+    except Exception as e:
+        log.warning("DELETE [%s] échoué (non bloquant) : %s", instance, e)
+
+    # 2. PUT — pousse les nouvelles métriques
     body = data.encode("utf-8")
     req = urllib.request.Request(
-        url,
+        base_url,
         data=body,
         method="PUT",
         headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            log.debug("Push OK vers %s : HTTP %s", url, resp.status)
+            log.debug("Push OK [%s] : HTTP %s", instance, resp.status)
             return True
     except urllib.error.HTTPError as e:
         log.error("Erreur push [%s] HTTP %s : %s", instance, e.code, e.read().decode()[:200])
@@ -229,7 +247,6 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
     except Exception as e:
         log.error("Erreur push [%s] : %s", instance, e)
         return False
-
 
 # ---------------------------------------------------------------------------
 # Boucle principale
