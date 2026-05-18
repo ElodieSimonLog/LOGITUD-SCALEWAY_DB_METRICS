@@ -146,7 +146,7 @@ def _deduplicate(lines: list[str]) -> list[str]:
             # Format : metric_name{labels} value [timestamp]
             # On sépare sur le premier espace après les accolades fermantes
             if "{" in stripped:
-                brace_end = stripped.index("}") + 1
+                brace_end = stripped.rindex("}") + 1
                 key = stripped[:brace_end]
             else:
                 key = stripped.split(" ")[0]
