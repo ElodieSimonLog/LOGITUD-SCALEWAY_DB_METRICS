@@ -5,6 +5,10 @@ cockpit_proxy.py
 Agrège les métriques Prometheus de tous les Cockpit Scaleway et les pousse
 vers un Pushgateway Prometheus toutes les PUSH_INTERVAL secondes.
 
+Le /federate Scaleway renvoie plusieurs points dans le temps pour une même
+série — ce script déduplique et ne garde que la dernière valeur par série
+avant de pusher, ce qui est requis par le Pushgateway.
+
 Expose aussi :
   GET /health    → {"status": "ok", "projects": [...], "last_push": "..."}
   GET /metrics   → métriques internes du proxy (durée, succès par projet)
@@ -12,7 +16,8 @@ Expose aussi :
 Configuration via variables d'environnement :
   COCKPIT_PROJECTS   JSON : liste de projets
                      ex : '[{"name":"prod","url":"https://xxx.metrics.cockpit.fr-par.scw.cloud","token":"xxx"},...]'
-  PUSHGATEWAY_URL    URL du Pushgateway (défaut : http://prometheus-pushgateway.grafana.svc.cluster.local:9091)
+  PUSHGATEWAY_URL    URL du Pushgateway
+                     (défaut : http://prometheus-pushgateway.grafana.svc.cluster.local:9091)
   PUSH_INTERVAL      Intervalle de push en secondes (défaut : 60)
   PROXY_PORT         Port d'écoute pour /health et /metrics internes (défaut : 8000)
   SCRAPE_TIMEOUT     Timeout par scrape en secondes (défaut : 30)
@@ -90,6 +95,7 @@ _RE_WITHOUT_LABELS = re.compile(r'^(\w+)(\s+.*)$')
 
 
 def _inject_label(line: str, label_kv: str) -> str:
+    """Injecte un label dans une ligne de métrique Prometheus."""
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         return line
@@ -106,6 +112,52 @@ def _inject_label(line: str, label_kv: str) -> str:
         return f"{name}{{{label_kv}}}{rest}\n"
 
     return line
+
+
+def _deduplicate(lines: list[str]) -> list[str]:
+    """
+    Déduplique les lignes de métriques.
+
+    Le /federate Scaleway renvoie plusieurs points dans le temps pour une
+    même série (même nom + mêmes labels, valeurs différentes). Le Pushgateway
+    n'accepte qu'une seule valeur par série — on garde la dernière occurrence.
+
+    Les lignes # HELP et # TYPE sont dédupliquées par nom de métrique.
+    """
+    help_lines = {}   # metric_name -> ligne # HELP
+    type_lines = {}   # metric_name -> ligne # TYPE
+    metric_lines = {} # "metric_name{labels}" -> dernière ligne de valeur
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("# HELP "):
+            parts = stripped.split(" ", 3)
+            if len(parts) >= 3:
+                help_lines[parts[2]] = line
+        elif stripped.startswith("# TYPE "):
+            parts = stripped.split(" ", 3)
+            if len(parts) >= 3:
+                type_lines[parts[2]] = line
+        elif not stripped.startswith("#"):
+            # Clé = tout ce qui précède la valeur (metric_name{labels})
+            # Format : metric_name{labels} value [timestamp]
+            # On sépare sur le premier espace après les accolades fermantes
+            if "{" in stripped:
+                brace_end = stripped.index("}") + 1
+                key = stripped[:brace_end]
+            else:
+                key = stripped.split(" ")[0]
+            metric_lines[key] = line  # écrase les anciennes valeurs
+
+    # Reconstruit dans l'ordre : HELP, TYPE, valeurs
+    result = []
+    result.extend(help_lines.values())
+    result.extend(type_lines.values())
+    result.extend(metric_lines.values())
+    return result
 
 
 def scrape_project(project: dict) -> tuple[str, str | None, float]:
@@ -130,8 +182,16 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 
     duration = time.monotonic() - t0
 
+    # Injection du label scaleway_project sur chaque ligne
     lines = raw.splitlines(keepends=True)
     labeled = [_inject_label(line, label) for line in lines]
+
+    # Déduplication — le /federate renvoie plusieurs points par série
+    deduped = _deduplicate(labeled)
+    log.debug(
+        "[%s] scrape OK en %.2fs — %d lignes brutes → %d après dédup",
+        name, duration, len(lines), len(deduped)
+    )
 
     meta = (
         f"# HELP cockpit_proxy_scrape_success 1 if last scrape succeeded\n"
@@ -142,17 +202,16 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
         f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
     )
 
-    log.debug("[%s] scrape OK en %.2fs (%d lignes)", name, duration, len(lines))
-    return name, "".join(labeled) + meta, duration
+    return name, "".join(deduped) + meta, duration
 
 
 # ---------------------------------------------------------------------------
 # Push vers le Pushgateway
 # ---------------------------------------------------------------------------
 
-def push_to_gateway(job: str, data: str) -> bool:
-    """Pousse les métriques vers le Pushgateway via PUT /metrics/job/<job>."""
-    url = f"{PUSHGATEWAY_URL}/metrics/job/{job}"
+def push_to_gateway(job: str, instance: str, data: str) -> bool:
+    """Pousse les métriques vers le Pushgateway via PUT /metrics/job/<job>/instance/<instance>."""
+    url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
     body = data.encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -164,10 +223,17 @@ def push_to_gateway(job: str, data: str) -> bool:
         with urllib.request.urlopen(req, timeout=30) as resp:
             log.debug("Push OK vers %s : HTTP %s", url, resp.status)
             return True
+    except urllib.error.HTTPError as e:
+        log.error("Erreur push [%s] HTTP %s : %s", instance, e.code, e.read().decode()[:200])
+        return False
     except Exception as e:
-        log.error("Erreur push vers %s : %s", url, e)
+        log.error("Erreur push [%s] : %s", instance, e)
         return False
 
+
+# ---------------------------------------------------------------------------
+# Boucle principale
+# ---------------------------------------------------------------------------
 
 def scrape_and_push():
     """Scrape tous les projets en parallèle puis pousse par projet vers le Pushgateway."""
@@ -188,11 +254,11 @@ def scrape_and_push():
             name, text, duration = future.result()
             results[name] = (text, duration)
 
-    # Push projet par projet — évite les 51 MB en un seul push
+    # Push projet par projet — évite un payload géant
     all_ok = True
     for name, (text, duration) in results.items():
         if text:
-            ok = push_to_gateway(f"cockpit-proxy/instance/{name}", text)
+            ok = push_to_gateway("cockpit-proxy", name, text)
             if ok:
                 projects_ok.append(name)
                 log.info("[%s] push OK", name)
@@ -207,7 +273,7 @@ def scrape_and_push():
                 f"cockpit_proxy_scrape_success{{{label}}} 0\n"
                 f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
             )
-            push_to_gateway(f"cockpit-proxy/instance/{name}", fail_metric)
+            push_to_gateway("cockpit-proxy", name, fail_metric)
 
     total = time.monotonic() - t0
     log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, projects_ok, projects_fail)
