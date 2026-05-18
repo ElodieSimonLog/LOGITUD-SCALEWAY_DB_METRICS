@@ -247,7 +247,6 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
     except Exception as e:
         log.error("Erreur push [%s] : %s", instance, e)
         return False
-
 # ---------------------------------------------------------------------------
 # Boucle principale
 # ---------------------------------------------------------------------------
