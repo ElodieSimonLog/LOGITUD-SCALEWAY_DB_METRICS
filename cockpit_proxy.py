@@ -199,7 +199,15 @@ def scrape_and_push():
         _state["projects_ok"] = projects_ok
         _state["projects_fail"] = projects_fail
 
-
+def push_loop():
+    """Boucle de push en arrière-plan."""
+    log.info("Démarrage de la boucle de push (intervalle : %ds)", PUSH_INTERVAL)
+    while True:
+        try:
+            scrape_and_push()
+        except Exception as e:
+            log.error("Erreur inattendue dans la boucle de push : %s", e)
+        time.sleep(PUSH_INTERVAL)
 # ---------------------------------------------------------------------------
 # Serveur HTTP (health + métriques internes)
 # ---------------------------------------------------------------------------
