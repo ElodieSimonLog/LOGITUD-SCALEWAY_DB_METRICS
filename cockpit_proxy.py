@@ -41,9 +41,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("cockpit-proxy")
 
-PROXY_PORT     = int(os.environ.get("PROXY_PORT", "8000"))
-SCRAPE_TIMEOUT = int(os.environ.get("SCRAPE_TIMEOUT", "30"))
-PUSH_INTERVAL  = int(os.environ.get("PUSH_INTERVAL", "60"))
+PROXY_PORT      = int(os.environ.get("PROXY_PORT", "8000"))
+SCRAPE_TIMEOUT  = int(os.environ.get("SCRAPE_TIMEOUT", "30"))
+PUSH_INTERVAL   = int(os.environ.get("PUSH_INTERVAL", "60"))
 PUSHGATEWAY_URL = os.environ.get(
     "PUSHGATEWAY_URL",
     "http://prometheus-pushgateway.grafana.svc.cluster.local:9091"
@@ -170,24 +170,44 @@ def push_to_gateway(job: str, data: str) -> bool:
 
 
 def scrape_and_push():
+    """Scrape tous les projets en parallèle puis pousse par projet vers le Pushgateway."""
+    if not PROJECTS:
+        log.error("Aucun projet configuré.")
+        return
+
     t0 = time.monotonic()
-    all_text = []
     projects_ok = []
     projects_fail = []
 
+    # Scrape en parallèle — tous les projets au même moment
+    results = {}
     with ThreadPoolExecutor(max_workers=min(len(PROJECTS), 10)) as pool:
         futures = {pool.submit(scrape_project, p): p for p in PROJECTS}
         for future in as_completed(futures):
             project = futures[future]
             name, text, duration = future.result()
-            if text:
-                all_text.append(text)
+            results[name] = (text, duration)
+
+    # Push projet par projet — évite les 51 MB en un seul push
+    all_ok = True
+    for name, (text, duration) in results.items():
+        if text:
+            ok = push_to_gateway(f"cockpit-proxy/{name}", text)
+            if ok:
                 projects_ok.append(name)
+                log.info("[%s] push OK", name)
             else:
                 projects_fail.append(name)
-
-    # Un seul push avec tout
-    ok = push_to_gateway("cockpit-proxy", "\n".join(all_text))
+                all_ok = False
+        else:
+            projects_fail.append(name)
+            all_ok = False
+            label = f'scaleway_project="{name}"'
+            fail_metric = (
+                f"cockpit_proxy_scrape_success{{{label}}} 0\n"
+                f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
+            )
+            push_to_gateway(f"cockpit-proxy/{name}", fail_metric)
 
     total = time.monotonic() - t0
     log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, projects_ok, projects_fail)
@@ -195,9 +215,10 @@ def scrape_and_push():
     with _state_lock:
         _state["last_push"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _state["last_push_duration"] = round(total, 2)
-        _state["last_push_status"] = "ok" if ok and not projects_fail else "partial"
+        _state["last_push_status"] = "ok" if all_ok else "partial"
         _state["projects_ok"] = projects_ok
         _state["projects_fail"] = projects_fail
+
 
 def push_loop():
     """Boucle de push en arrière-plan."""
@@ -208,6 +229,8 @@ def push_loop():
         except Exception as e:
             log.error("Erreur inattendue dans la boucle de push : %s", e)
         time.sleep(PUSH_INTERVAL)
+
+
 # ---------------------------------------------------------------------------
 # Serveur HTTP (health + métriques internes)
 # ---------------------------------------------------------------------------
