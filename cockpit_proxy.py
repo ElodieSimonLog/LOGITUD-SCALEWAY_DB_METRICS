@@ -9,6 +9,9 @@ Le /federate Scaleway renvoie plusieurs points dans le temps pour une même
 série — ce script déduplique et ne garde que la dernière valeur par série
 avant de pusher, ce qui est requis par le Pushgateway.
 
+Les métriques object_storage_bucket_* sont exclues (labelsets incohérents
+entre séries, incompatibles avec le Pushgateway).
+
 Expose aussi :
   GET /health    → {"status": "ok", "projects": [...], "last_push": "..."}
   GET /metrics   → métriques internes du proxy (durée, succès par projet)
@@ -53,6 +56,11 @@ PUSHGATEWAY_URL = os.environ.get(
     "PUSHGATEWAY_URL",
     "http://prometheus-pushgateway.grafana.svc.cluster.local:9091"
 ).rstrip("/")
+
+# Métriques exclues du scrape (préfixes, appliqués sur les lignes # HELP/TYPE et séries)
+METRIC_BLACKLIST_RE = re.compile(
+    r'^(?:# (?:HELP|TYPE) )?object_storage_bucket_'
+)
 
 
 def load_projects() -> list[dict]:
@@ -182,15 +190,23 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 
     duration = time.monotonic() - t0
 
-    # Injection du label scaleway_project sur chaque ligne
+    # Blacklist : suppression des métriques object_storage_bucket_*
+    # (labelsets incohérents entre séries — rejetés par le Pushgateway)
     lines = raw.splitlines(keepends=True)
+    before = len(lines)
+    lines = [l for l in lines if not METRIC_BLACKLIST_RE.match(l.lstrip())]
+    dropped = before - len(lines)
+    if dropped:
+        log.debug("[%s] %d lignes object_storage_bucket_* supprimées", name, dropped)
+
+    # Injection du label scaleway_project sur chaque ligne
     labeled = [_inject_label(line, label) for line in lines]
 
     # Déduplication — le /federate renvoie plusieurs points par série
     deduped = _deduplicate(labeled)
     log.debug(
-        "[%s] scrape OK en %.2fs — %d lignes brutes → %d après dédup",
-        name, duration, len(lines), len(deduped)
+        "[%s] scrape OK en %.2fs — %d lignes brutes → %d après filtre+dédup",
+        name, duration, before, len(deduped)
     )
 
     meta = (
@@ -211,9 +227,9 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 
 def push_to_gateway(job: str, instance: str, data: str) -> bool:
     """
-    Pousse les métriques vers le Pushgateway.
-    Effectue un DELETE préalable pour éviter les conflits de labelsets
-    entre cycles (métriques périmées ou labelsets changeants).
+    Pousse les métriques vers le Pushgateway via DELETE puis PUT.
+    Le DELETE préalable vide le groupe pour éviter tout conflit résiduel
+    avec d'éventuelles métriques périmées d'un cycle précédent.
     """
     base_url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
 
@@ -223,7 +239,6 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
         with urllib.request.urlopen(del_req, timeout=10) as resp:
             log.debug("DELETE OK [%s] : HTTP %s", instance, resp.status)
     except urllib.error.HTTPError as e:
-        # 404 = groupe inexistant, pas un problème
         if e.code != 404:
             log.warning("DELETE [%s] HTTP %s (non bloquant)", instance, e.code)
     except Exception as e:
@@ -247,6 +262,8 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
     except Exception as e:
         log.error("Erreur push [%s] : %s", instance, e)
         return False
+
+
 # ---------------------------------------------------------------------------
 # Boucle principale
 # ---------------------------------------------------------------------------
