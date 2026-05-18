@@ -192,7 +192,7 @@ def scrape_and_push():
     all_ok = True
     for name, (text, duration) in results.items():
         if text:
-            ok = push_to_gateway(f"cockpit-proxy/{name}", text)
+            ok = push_to_gateway(f"cockpit-proxy/instance/{name}", text)
             if ok:
                 projects_ok.append(name)
                 log.info("[%s] push OK", name)
@@ -207,7 +207,7 @@ def scrape_and_push():
                 f"cockpit_proxy_scrape_success{{{label}}} 0\n"
                 f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
             )
-            push_to_gateway(f"cockpit-proxy/{name}", fail_metric)
+            push_to_gateway(f"cockpit-proxy/instance/{name}", fail_metric)
 
     total = time.monotonic() - t0
     log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, projects_ok, projects_fail)
