@@ -115,6 +115,7 @@ def _inject_label(line: str, label_kv: str) -> str:
 
 def scrape_project(project: dict) -> tuple[str, str | None, float]:
     name  = project["name"]
+    label = f'scaleway_project="{name}"'         
     base  = project["url"].rstrip("/") + "/federate"
     query = urlencode({"match[]": '{__name__=~".+"}'})
     url   = f"{base}?{query}"
