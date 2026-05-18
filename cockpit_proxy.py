@@ -2,42 +2,28 @@
 """
 cockpit_proxy.py
 ================
-Proxy HTTP qui agrège les métriques Prometheus de tous les Cockpit Scaleway
-(un par projet) et les expose sur un seul endpoint /metrics.
+Agrège les métriques Prometheus de tous les Cockpit Scaleway et les pousse
+vers un Pushgateway Prometheus toutes les PUSH_INTERVAL secondes.
 
-Grafana n'a besoin que d'une seule data source Prometheus pointant sur ce proxy.
+Expose aussi :
+  GET /health    → {"status": "ok", "projects": [...], "last_push": "..."}
+  GET /metrics   → métriques internes du proxy (durée, succès par projet)
 
-Configuration via variables d'environnement (Secret Kubernetes) :
-  COCKPIT_PROJECTS   JSON : liste de projets avec leur token et leur URL
-                     ex : '[{"name":"prod","url":"https://metrics.cockpit.fr-par.scaleway.com","token":"xxx"},...]'
-  PROXY_PORT         Port d'écoute (défaut : 8000)
-  SCRAPE_TIMEOUT     Timeout par scrape en secondes (défaut : 10)
+Configuration via variables d'environnement :
+  COCKPIT_PROJECTS   JSON : liste de projets
+                     ex : '[{"name":"prod","url":"https://xxx.metrics.cockpit.fr-par.scw.cloud","token":"xxx"},...]'
+  PUSHGATEWAY_URL    URL du Pushgateway (défaut : http://prometheus-pushgateway.grafana.svc.cluster.local:9091)
+  PUSH_INTERVAL      Intervalle de push en secondes (défaut : 60)
+  PROXY_PORT         Port d'écoute pour /health et /metrics internes (défaut : 8000)
+  SCRAPE_TIMEOUT     Timeout par scrape en secondes (défaut : 30)
   LOG_LEVEL          DEBUG | INFO | WARNING (défaut : INFO)
-
-Format du label injecté : scaleway_project="<name>"
-
-Exemple de Secret Kubernetes :
-  apiVersion: v1
-  kind: Secret
-  metadata:
-    name: cockpit-proxy-secret
-  stringData:
-    COCKPIT_PROJECTS: |
-      [
-        {"name": "default",  "url": "https://metrics.cockpit.fr-par.scaleway.com", "token": "xxx"},
-        {"name": "staging",  "url": "https://metrics.cockpit.fr-par.scaleway.com", "token": "yyy"},
-        {"name": "prod",     "url": "https://metrics.cockpit.nl-ams.scaleway.com", "token": "zzz"}
-      ]
-
-Endpoints exposés :
-  GET /metrics   → métriques agrégées (format Prometheus text)
-  GET /health    → {"status": "ok", "projects": [...]}
 """
 
 import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -55,11 +41,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("cockpit-proxy")
 
-PROXY_PORT    = int(os.environ.get("PROXY_PORT", "8000"))
-SCRAPE_TIMEOUT = int(os.environ.get("SCRAPE_TIMEOUT", "10"))
+PROXY_PORT     = int(os.environ.get("PROXY_PORT", "8000"))
+SCRAPE_TIMEOUT = int(os.environ.get("SCRAPE_TIMEOUT", "30"))
+PUSH_INTERVAL  = int(os.environ.get("PUSH_INTERVAL", "60"))
+PUSHGATEWAY_URL = os.environ.get(
+    "PUSHGATEWAY_URL",
+    "http://prometheus-pushgateway.grafana.svc.cluster.local:9091"
+).rstrip("/")
+
 
 def load_projects() -> list[dict]:
-    """Charge la liste des projets depuis COCKPIT_PROJECTS (JSON)."""
     raw = os.environ.get("COCKPIT_PROJECTS", "")
     if not raw:
         log.error("Variable COCKPIT_PROJECTS manquante ou vide.")
@@ -80,21 +71,25 @@ def load_projects() -> list[dict]:
 
 PROJECTS = load_projects()
 
+# État partagé (thread-safe via lock)
+_state_lock = threading.Lock()
+_state = {
+    "last_push": None,
+    "last_push_duration": None,
+    "last_push_status": "pending",
+    "projects_ok": [],
+    "projects_fail": [],
+}
+
 # ---------------------------------------------------------------------------
 # Scrape d'un projet Cockpit
 # ---------------------------------------------------------------------------
 
-# Regex pour injecter un label dans une ligne de métrique
-# Gère : metric{labels} value  ET  metric value  (sans accolades)
 _RE_WITH_LABELS    = re.compile(r'^(\w+)\{([^}]*)\}(.*)$')
 _RE_WITHOUT_LABELS = re.compile(r'^(\w+)(\s+.*)$')
 
 
 def _inject_label(line: str, label_kv: str) -> str:
-    """
-    Injecte label_kv (ex: 'scaleway_project="prod"') dans une ligne de métriques.
-    Ignore les lignes # HELP / # TYPE / vides.
-    """
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         return line
@@ -115,7 +110,7 @@ def _inject_label(line: str, label_kv: str) -> str:
 
 def scrape_project(project: dict) -> tuple[str, str | None, float]:
     name  = project["name"]
-    label = f'scaleway_project="{name}"'         
+    label = f'scaleway_project="{name}"'
     base  = project["url"].rstrip("/") + "/federate"
     query = urlencode({"match[]": '{__name__=~".+"}'})
     url   = f"{base}?{query}"
@@ -135,11 +130,9 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 
     duration = time.monotonic() - t0
 
-    # Injection du label scaleway_project sur chaque ligne de métrique
     lines = raw.splitlines(keepends=True)
     labeled = [_inject_label(line, label) for line in lines]
 
-    # Méta-métrique : succès du scrape
     meta = (
         f"# HELP cockpit_proxy_scrape_success 1 if last scrape succeeded\n"
         f"# TYPE cockpit_proxy_scrape_success gauge\n"
@@ -153,70 +146,124 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
     return name, "".join(labeled) + meta, duration
 
 
-def scrape_all() -> str:
-    """Scrape tous les projets en parallèle et concatène les résultats."""
-    if not PROJECTS:
-        return "# ERROR: no projects configured\n"
+# ---------------------------------------------------------------------------
+# Push vers le Pushgateway
+# ---------------------------------------------------------------------------
 
-    parts = []
+def push_to_gateway(job: str, data: str) -> bool:
+    """Pousse les métriques vers le Pushgateway via PUT /metrics/job/<job>."""
+    url = f"{PUSHGATEWAY_URL}/metrics/job/{job}"
+    body = data.encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="PUT",
+        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            log.debug("Push OK vers %s : HTTP %s", url, resp.status)
+            return True
+    except Exception as e:
+        log.error("Erreur push vers %s : %s", url, e)
+        return False
+
+
+def scrape_and_push():
+    t0 = time.monotonic()
+    all_text = []
+    projects_ok = []
+    projects_fail = []
+
     with ThreadPoolExecutor(max_workers=min(len(PROJECTS), 10)) as pool:
-        futures = {pool.submit(scrape_project, p): p["name"] for p in PROJECTS}
+        futures = {pool.submit(scrape_project, p): p for p in PROJECTS}
         for future in as_completed(futures):
+            project = futures[future]
             name, text, duration = future.result()
             if text:
-                parts.append(text)
+                all_text.append(text)
+                projects_ok.append(name)
             else:
-                label = f'scaleway_project="{name}"'
-                parts.append(
-                    f"cockpit_proxy_scrape_success{{{label}}} 0\n"
-                    f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
-                )
+                projects_fail.append(name)
 
-    return "\n".join(parts)
+    # Un seul push avec tout
+    ok = push_to_gateway("cockpit-proxy", "\n".join(all_text))
+
+    total = time.monotonic() - t0
+    log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, projects_ok, projects_fail)
+
+    with _state_lock:
+        _state["last_push"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _state["last_push_duration"] = round(total, 2)
+        _state["last_push_status"] = "ok" if ok and not projects_fail else "partial"
+        _state["projects_ok"] = projects_ok
+        _state["projects_fail"] = projects_fail
 
 
 # ---------------------------------------------------------------------------
-# Serveur HTTP
+# Serveur HTTP (health + métriques internes)
 # ---------------------------------------------------------------------------
 
 class ProxyHandler(BaseHTTPRequestHandler):
 
-    def log_message(self, fmt, *args):  # silence le logger HTTP par défaut
+    def log_message(self, fmt, *args):
         log.debug("HTTP %s", fmt % args)
 
     def do_GET(self):
-        if self.path == "/metrics":
-            self._handle_metrics()
-        elif self.path == "/health":
+        if self.path == "/health":
             self._handle_health()
+        elif self.path == "/metrics":
+            self._handle_metrics()
         else:
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found\n")
 
-    def _handle_metrics(self):
-        t0 = time.monotonic()
-        body = scrape_all().encode("utf-8")
-        duration = time.monotonic() - t0
-        log.info("/metrics agrégé en %.2fs (%d bytes)", duration, len(body))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
     def _handle_health(self):
+        with _state_lock:
+            state = dict(_state)
+
         payload = json.dumps({
-            "status": "ok",
+            "status": state["last_push_status"],
             "projects": [p["name"] for p in PROJECTS],
             "project_count": len(PROJECTS),
-        }).encode("utf-8")
+            "last_push": state["last_push"],
+            "last_push_duration_seconds": state["last_push_duration"],
+            "projects_ok": state["projects_ok"],
+            "projects_fail": state["projects_fail"],
+        }, indent=2).encode("utf-8")
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _handle_metrics(self):
+        """Métriques internes du proxy (pas les métriques Cockpit)."""
+        with _state_lock:
+            state = dict(_state)
+
+        lines = [
+            "# HELP cockpit_proxy_last_push_duration_seconds Duration of last push cycle\n",
+            "# TYPE cockpit_proxy_last_push_duration_seconds gauge\n",
+        ]
+        if state["last_push_duration"] is not None:
+            lines.append(f"cockpit_proxy_last_push_duration_seconds {state['last_push_duration']}\n")
+
+        for name in state.get("projects_ok", []):
+            label = f'scaleway_project="{name}"'
+            lines.append(f"cockpit_proxy_project_up{{{label}}} 1\n")
+        for name in state.get("projects_fail", []):
+            label = f'scaleway_project="{name}"'
+            lines.append(f"cockpit_proxy_project_up{{{label}}} 0\n")
+
+        body = "".join(lines).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +275,16 @@ if __name__ == "__main__":
         log.error("Aucun projet configuré — vérifier COCKPIT_PROJECTS.")
         raise SystemExit(1)
 
+    # Lancement de la boucle de push en arrière-plan
+    t = threading.Thread(target=push_loop, daemon=True)
+    t.start()
+
+    # Serveur HTTP pour /health et /metrics internes
     server = HTTPServer(("0.0.0.0", PROXY_PORT), ProxyHandler)
     log.info("Proxy démarré sur :%d", PROXY_PORT)
     log.info("Projets : %s", [p["name"] for p in PROJECTS])
-    log.info("Endpoints : /metrics  /health")
+    log.info("Pushgateway : %s", PUSHGATEWAY_URL)
+    log.info("Intervalle de push : %ds", PUSH_INTERVAL)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
