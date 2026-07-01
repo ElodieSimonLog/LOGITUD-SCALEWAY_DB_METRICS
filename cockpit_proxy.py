@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-cockpit_proxy.py
-================
-Agrège les métriques Prometheus de tous les Cockpit Scaleway et les pousse
-vers un Pushgateway Prometheus toutes les PUSH_INTERVAL secondes.
-
-Le /federate Scaleway renvoie plusieurs points dans le temps pour une même
-série — ce script déduplique et ne garde que la dernière valeur par série
-avant de pusher, ce qui est requis par le Pushgateway.
-
-Les métriques object_storage_bucket_* sont exclues (labelsets incohérents
-entre séries, incompatibles avec le Pushgateway).
-
+monitoring_proxy.py
+===================
+Agrège les métriques de :
+  1. Scaleway Cockpit (via /federate)
+  2. PMM Prometheus (sources locales : node_exporter + postgres_exporter)
+ 
+Pousse tout vers un Pushgateway Prometheus avec des labels `environment`:
+  - environment="scaleway" pour Cockpit
+  - environment="local" pour PMM
+ 
 Expose aussi :
-  GET /health    → {"status": "ok", "projects": [...], "last_push": "..."}
-  GET /metrics   → métriques internes du proxy (durée, succès par projet)
-
+  GET /health    → état global
+  GET /metrics   → métriques internes du proxy
+ 
 Configuration via variables d'environnement :
-  COCKPIT_PROJECTS   JSON : liste de projets
-                     ex : '[{"name":"prod","url":"https://xxx.metrics.cockpit.fr-par.scw.cloud","token":"xxx"},...]'
-  PUSHGATEWAY_URL    URL du Pushgateway
-                     (défaut : http://prometheus-pushgateway.grafana.svc.cluster.local:9091)
-  PUSH_INTERVAL      Intervalle de push en secondes (défaut : 60)
-  PROXY_PORT         Port d'écoute pour /health et /metrics internes (défaut : 8000)
-  SCRAPE_TIMEOUT     Timeout par scrape en secondes (défaut : 30)
-  LOG_LEVEL          DEBUG | INFO | WARNING (défaut : INFO)
+  COCKPIT_PROJECTS        JSON : liste de projets Scaleway
+  PUSHGATEWAY_URL         URL du Pushgateway
+  PUSH_INTERVAL           Intervalle de push en secondes (défaut : 60)
+  PMM_PROMETHEUS_URL      URL du Prometheus de PMM
+                          (défaut : http://monitoring-service.grafana.svc.cluster.local/prometheus)
+  PMM_BASIC_AUTH_USER     Utilisateur pour PMM (défaut : admin)
+  PMM_BASIC_AUTH_PASSWORD Mot de passe PMM (défaut : "")
+  PROXY_PORT              Port d'écoute (défaut : 8000)
+  SCRAPE_TIMEOUT          Timeout par scrape en secondes (défaut : 30)
+  LOG_LEVEL               DEBUG | INFO | WARNING (défaut : INFO)
 """
+
 
 import json
 import logging
@@ -38,6 +39,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode
 import urllib.request
 import urllib.error
+import base64
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,16 +60,29 @@ PUSHGATEWAY_URL = os.environ.get(
     "http://prometheus-pushgateway.grafana.svc.cluster.local:9091"
 ).rstrip("/")
 
+PMM_PROMETHEUS_URL      = os.environ.get(
+    "PMM_PROMETHEUS_URL",
+    "http://monitoring-service.grafana.svc.cluster.local/prometheus"
+).rstrip("/")
+PMM_BASIC_AUTH_USER     = os.environ.get("PMM_BASIC_AUTH_USER", "admin")
+PMM_BASIC_AUTH_PASSWORD = os.environ.get("PMM_BASIC_AUTH_PASSWORD", "")
+
+
 # Métriques exclues du scrape (préfixes, appliqués sur les lignes # HELP/TYPE et séries)
 METRIC_BLACKLIST_RE = re.compile(
     r'^(?:# (?:HELP|TYPE) )?object_storage_bucket_'
 )
 
+PMM_JOBS = [
+    "node_exporter_*",
+    "postgres_exporter_*",
+]
+
 
 def load_projects() -> list[dict]:
     raw = os.environ.get("COCKPIT_PROJECTS", "")
     if not raw:
-        log.error("Variable COCKPIT_PROJECTS manquante ou vide.")
+        log.warning("Variable COCKPIT_PROJECTS vide — Scaleway disabled")
         return []
     try:
         projects = json.loads(raw)
@@ -78,11 +94,12 @@ def load_projects() -> list[dict]:
             if field not in p:
                 log.error("Projet mal configuré, champ manquant '%s' : %s", field, p)
                 return []
-    log.info("Projets chargés : %s", [p["name"] for p in projects])
+    log.info("Projets Scaleway chargés : %s", [p["name"] for p in projects])
     return projects
+ 
+ 
+COCKPIT_PROJECTS = load_projects()
 
-
-PROJECTS = load_projects()
 
 # État partagé (thread-safe via lock)
 _state_lock = threading.Lock()
@@ -93,6 +110,34 @@ _state = {
     "projects_ok": [],
     "projects_fail": [],
 }
+
+def scrape_prometheus(url: str, query: str, auth_user: str = "", auth_password: str = "") -> tuple[str | None, float]:
+    """
+    Scrape un endpoint Prometheus /federate et retourne le texte brut.
+    """
+    base = url.rstrip("/") + "/federate"
+    q = urlencode({"match[]": query})
+    full_url = f"{base}?{q}"
+ 
+    t0 = time.monotonic()
+    req = urllib.request.Request(full_url)
+ 
+    # Ajoute l'auth Basic si fournie
+    if auth_user and auth_password:
+        credentials = base64.b64encode(f"{auth_user}:{auth_password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {credentials}")
+ 
+    try:
+        with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        log.warning("HTTP %s lors du scrape de %s", e.code, full_url)
+        return None, time.monotonic() - t0
+    except Exception as e:
+        log.warning("Erreur scrape %s : %s", full_url, e)
+        return None, time.monotonic() - t0
+ 
+    return raw, time.monotonic() - t0
 
 # ---------------------------------------------------------------------------
 # Scrape d'un projet Cockpit
@@ -107,40 +152,37 @@ def _inject_label(line: str, label_kv: str) -> str:
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         return line
-
+ 
     m = _RE_WITH_LABELS.match(stripped)
     if m:
         name, existing, rest = m.groups()
         new_labels = f"{existing},{label_kv}" if existing else label_kv
         return f"{name}{{{new_labels}}}{rest}\n"
-
+ 
     m = _RE_WITHOUT_LABELS.match(stripped)
     if m:
         name, rest = m.groups()
         return f"{name}{{{label_kv}}}{rest}\n"
-
+ 
     return line
+
 
 
 def _deduplicate(lines: list[str]) -> list[str]:
     """
     Déduplique les lignes de métriques.
-
-    Le /federate Scaleway renvoie plusieurs points dans le temps pour une
-    même série (même nom + mêmes labels, valeurs différentes). Le Pushgateway
-    n'accepte qu'une seule valeur par série — on garde la dernière occurrence.
-
-    Les lignes # HELP et # TYPE sont dédupliquées par nom de métrique.
+    Le /federate renvoie plusieurs points dans le temps pour une même série.
+    Le Pushgateway n'accepte qu'une seule valeur par série — on garde la dernière.
     """
-    help_lines = {}   # metric_name -> ligne # HELP
-    type_lines = {}   # metric_name -> ligne # TYPE
-    metric_lines = {} # "metric_name{labels}" -> dernière ligne de valeur
-
+    help_lines = {}
+    type_lines = {}
+    metric_lines = {}
+ 
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-
+ 
         if stripped.startswith("# HELP "):
             parts = stripped.split(" ", 3)
             if len(parts) >= 3:
@@ -150,17 +192,13 @@ def _deduplicate(lines: list[str]) -> list[str]:
             if len(parts) >= 3:
                 type_lines[parts[2]] = line
         elif not stripped.startswith("#"):
-            # Clé = tout ce qui précède la valeur (metric_name{labels})
-            # Format : metric_name{labels} value [timestamp]
-            # On sépare sur le premier espace après les accolades fermantes
             if "{" in stripped:
                 brace_end = stripped.rindex("}") + 1
                 key = stripped[:brace_end]
             else:
                 key = stripped.split(" ")[0]
-            metric_lines[key] = line  # écrase les anciennes valeurs
-
-    # Reconstruit dans l'ordre : HELP, TYPE, valeurs
+            metric_lines[key] = line
+ 
     result = []
     result.extend(help_lines.values())
     result.extend(type_lines.values())
@@ -168,57 +206,127 @@ def _deduplicate(lines: list[str]) -> list[str]:
     return result
 
 
-def scrape_project(project: dict) -> tuple[str, str | None, float]:
+
+def scrape_cockpit_project(project: dict) -> tuple[str, str | None, float]:
+    """Scrape un projet Scaleway Cockpit."""
     name  = project["name"]
-    label = f'scaleway_project="{name}"'
+    label = f'environment="scaleway",scaleway_project="{name}"'
     base  = project["url"].rstrip("/") + "/federate"
     query = urlencode({"match[]": '{__name__=~".+"}'})
     url   = f"{base}?{query}"
     token = project["token"]
-
+ 
     t0 = time.monotonic()
     req = urllib.request.Request(url, headers={"X-Token": token})
     try:
         with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
-        log.warning("[%s] HTTP %s lors du scrape : %s", name, e.code, url)
+        log.warning("[Cockpit:%s] HTTP %s", name, e.code)
         return name, None, time.monotonic() - t0
     except Exception as e:
-        log.warning("[%s] Erreur scrape : %s", name, e)
+        log.warning("[Cockpit:%s] Erreur : %s", name, e)
         return name, None, time.monotonic() - t0
-
+ 
     duration = time.monotonic() - t0
-
-    # Blacklist : suppression des métriques object_storage_bucket_*
-    # (labelsets incohérents entre séries — rejetés par le Pushgateway)
+ 
+    # Filtrer les métriques object_storage_bucket_*
     lines = raw.splitlines(keepends=True)
     before = len(lines)
     lines = [l for l in lines if not METRIC_BLACKLIST_RE.match(l.lstrip())]
     dropped = before - len(lines)
     if dropped:
-        log.debug("[%s] %d lignes object_storage_bucket_* supprimées", name, dropped)
-
-    # Injection du label scaleway_project sur chaque ligne
+        log.debug("[Cockpit:%s] %d lignes object_storage_bucket_* supprimées", name, dropped)
+ 
+    # Inject label
     labeled = [_inject_label(line, label) for line in lines]
-
-    # Déduplication — le /federate renvoie plusieurs points par série
+ 
+    # Dédup
     deduped = _deduplicate(labeled)
     log.debug(
-        "[%s] scrape OK en %.2fs — %d lignes brutes → %d après filtre+dédup",
+        "[Cockpit:%s] scrape OK en %.2fs — %d lignes → %d après filtre+dédup",
         name, duration, before, len(deduped)
     )
-
+ 
+    # Ajouter les métriques internes
     meta = (
-        f"# HELP cockpit_proxy_scrape_success 1 if last scrape succeeded\n"
-        f"# TYPE cockpit_proxy_scrape_success gauge\n"
-        f"cockpit_proxy_scrape_success{{{label}}} 1\n"
-        f"# HELP cockpit_proxy_scrape_duration_seconds Duration of last scrape\n"
-        f"# TYPE cockpit_proxy_scrape_duration_seconds gauge\n"
-        f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
+        f"# HELP monitoring_proxy_scrape_success 1 if last scrape succeeded\n"
+        f"# TYPE monitoring_proxy_scrape_success gauge\n"
+        f"monitoring_proxy_scrape_success{{{label}}} 1\n"
+        f"# HELP monitoring_proxy_scrape_duration_seconds Duration of last scrape\n"
+        f"# TYPE monitoring_proxy_scrape_duration_seconds gauge\n"
+        f"monitoring_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
     )
-
+ 
     return name, "".join(deduped) + meta, duration
+ 
+ 
+def scrape_pmm() -> tuple[str, str | None, float]:
+    """Scrape PMM Prometheus et retourne les métriques locales."""
+    t0 = time.monotonic()
+ 
+    # Scrape tout ce qui n'est pas Scaleway
+    query = '{__name__=~".+"}'
+    raw, duration = scrape_prometheus(
+        PMM_PROMETHEUS_URL,
+        query,
+        auth_user=PMM_BASIC_AUTH_USER,
+        auth_password=PMM_BASIC_AUTH_PASSWORD,
+    )
+ 
+    if not raw:
+        log.warning("[PMM] Erreur scrape")
+        return "pmm", None, time.monotonic() - t0
+ 
+    # Filter par jobs si nécessaire (node_exporter + postgres_exporter)
+    lines = raw.splitlines(keepends=True)
+    before = len(lines)
+ 
+    # Garde juste les jobs PMM (node_exporter, postgres_exporter, etc.)
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Garde les commentaires
+        if stripped.startswith("#"):
+            filtered_lines.append(line)
+        else:
+            # Pour les séries, filtre par job
+            if "job=" in stripped:
+                # Check que c'est un job PMM
+                if any(job.replace("*", "") in stripped for job in PMM_JOBS):
+                    filtered_lines.append(line)
+            elif not stripped.startswith("#") and not stripped:
+                # Ligne vide
+                filtered_lines.append(line)
+ 
+    dropped = before - len(filtered_lines)
+    if dropped:
+        log.debug("[PMM] %d lignes filtrées (jobs non-PMM)", dropped)
+ 
+    # Inject label environment=local
+    label = 'environment="local"'
+    labeled = [_inject_label(line, label) for line in filtered_lines]
+ 
+    # Dédup
+    deduped = _deduplicate(labeled)
+    log.debug(
+        "[PMM] scrape OK en %.2fs — %d lignes → %d après filtre+dédup",
+        duration, before, len(deduped)
+    )
+ 
+    # Meta
+    meta = (
+        f"# HELP monitoring_proxy_scrape_success 1 if last scrape succeeded\n"
+        f"# TYPE monitoring_proxy_scrape_success gauge\n"
+        f"monitoring_proxy_scrape_success{{environment=\"local\",source=\"pmm\"}} 1\n"
+        f"# HELP monitoring_proxy_scrape_duration_seconds Duration of last scrape\n"
+        f"# TYPE monitoring_proxy_scrape_duration_seconds gauge\n"
+        f"monitoring_proxy_scrape_duration_seconds{{environment=\"local\",source=\"pmm\"}} {duration:.3f}\n"
+    )
+ 
+    return "pmm", "".join(deduped) + meta, duration
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -226,14 +334,10 @@ def scrape_project(project: dict) -> tuple[str, str | None, float]:
 # ---------------------------------------------------------------------------
 
 def push_to_gateway(job: str, instance: str, data: str) -> bool:
-    """
-    Pousse les métriques vers le Pushgateway via DELETE puis PUT.
-    Le DELETE préalable vide le groupe pour éviter tout conflit résiduel
-    avec d'éventuelles métriques périmées d'un cycle précédent.
-    """
+    """Pousse les métriques vers le Pushgateway via DELETE puis PUT."""
     base_url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
-
-    # 1. DELETE — vide le groupe pour repartir d'un état propre
+ 
+    # DELETE
     try:
         del_req = urllib.request.Request(base_url, method="DELETE")
         with urllib.request.urlopen(del_req, timeout=10) as resp:
@@ -243,8 +347,8 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
             log.warning("DELETE [%s] HTTP %s (non bloquant)", instance, e.code)
     except Exception as e:
         log.warning("DELETE [%s] échoué (non bloquant) : %s", instance, e)
-
-    # 2. PUT — pousse les nouvelles métriques
+ 
+    # PUT
     body = data.encode("utf-8")
     req = urllib.request.Request(
         base_url,
@@ -257,7 +361,7 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
             log.debug("Push OK [%s] : HTTP %s", instance, resp.status)
             return True
     except urllib.error.HTTPError as e:
-        log.error("Erreur push [%s] HTTP %s : %s", instance, e.code, e.read().decode()[:200])
+        log.error("Erreur push [%s] HTTP %s", instance, e.code)
         return False
     except Exception as e:
         log.error("Erreur push [%s] : %s", instance, e)
@@ -269,56 +373,61 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def scrape_and_push():
-    """Scrape tous les projets en parallèle puis pousse par projet vers le Pushgateway."""
-    if not PROJECTS:
-        log.error("Aucun projet configuré.")
-        return
-
+    """Scrape Scaleway + PMM puis pousse vers le Pushgateway."""
     t0 = time.monotonic()
-    projects_ok = []
-    projects_fail = []
-
-    # Scrape en parallèle — tous les projets au même moment
+    sources_ok = []
+    sources_fail = []
     results = {}
-    with ThreadPoolExecutor(max_workers=min(len(PROJECTS), 10)) as pool:
-        futures = {pool.submit(scrape_project, p): p for p in PROJECTS}
+ 
+    # Scrape Scaleway en parallèle
+    with ThreadPoolExecutor(max_workers=min(len(COCKPIT_PROJECTS) + 1, 10)) as pool:
+        futures = {}
+ 
+        # Ajoute les jobs Scaleway
+        for p in COCKPIT_PROJECTS:
+            futures[pool.submit(scrape_cockpit_project, p)] = ("cockpit", p["name"])
+ 
+        # Ajoute le job PMM
+        futures[pool.submit(scrape_pmm)] = ("pmm", "pmm")
+ 
         for future in as_completed(futures):
-            project = futures[future]
-            name, text, duration = future.result()
-            results[name] = (text, duration)
-
-    # Push projet par projet — évite un payload géant
+            source_type, name = futures[future]
+            try:
+                proj_name, text, duration = future.result()
+                results[proj_name] = (text, duration)
+            except Exception as e:
+                log.error("[%s] Exception : %s", name, e)
+                results[name] = (None, 0)
+ 
+    # Push projet par projet
     all_ok = True
     for name, (text, duration) in results.items():
         if text:
-            ok = push_to_gateway("cockpit-proxy", name, text)
+            ok = push_to_gateway("monitoring-proxy", name, text)
             if ok:
-                projects_ok.append(name)
+                sources_ok.append(name)
                 log.info("[%s] push OK", name)
             else:
-                projects_fail.append(name)
+                sources_fail.append(name)
                 all_ok = False
         else:
-            projects_fail.append(name)
+            sources_fail.append(name)
             all_ok = False
-            label = f'scaleway_project="{name}"'
-            fail_metric = (
-                f"cockpit_proxy_scrape_success{{{label}}} 0\n"
-                f"cockpit_proxy_scrape_duration_seconds{{{label}}} {duration:.3f}\n"
-            )
-            push_to_gateway("cockpit-proxy", name, fail_metric)
-
+            # Push une métrique d'erreur
+            fail_metric = f"monitoring_proxy_scrape_success{{source=\"{name}\"}} 0\n"
+            push_to_gateway("monitoring-proxy", name, fail_metric)
+ 
     total = time.monotonic() - t0
-    log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, projects_ok, projects_fail)
-
+    log.info("Cycle terminé en %.2fs — OK: %s | FAIL: %s", total, sources_ok, sources_fail)
+ 
     with _state_lock:
         _state["last_push"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _state["last_push_duration"] = round(total, 2)
         _state["last_push_status"] = "ok" if all_ok else "partial"
-        _state["projects_ok"] = projects_ok
-        _state["projects_fail"] = projects_fail
-
-
+        _state["sources_ok"] = sources_ok
+        _state["sources_fail"] = sources_fail
+ 
+ 
 def push_loop():
     """Boucle de push en arrière-plan."""
     log.info("Démarrage de la boucle de push (intervalle : %ds)", PUSH_INTERVAL)
@@ -328,17 +437,15 @@ def push_loop():
         except Exception as e:
             log.error("Erreur inattendue dans la boucle de push : %s", e)
         time.sleep(PUSH_INTERVAL)
+ 
 
 
-# ---------------------------------------------------------------------------
-# Serveur HTTP (health + métriques internes)
-# ---------------------------------------------------------------------------
 
 class ProxyHandler(BaseHTTPRequestHandler):
-
+ 
     def log_message(self, fmt, *args):
         log.debug("HTTP %s", fmt % args)
-
+ 
     def do_GET(self):
         if self.path == "/health":
             self._handle_health()
@@ -348,52 +455,53 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found\n")
-
+ 
     def _handle_health(self):
         with _state_lock:
             state = dict(_state)
-
+ 
         payload = json.dumps({
             "status": state["last_push_status"],
-            "projects": [p["name"] for p in PROJECTS],
-            "project_count": len(PROJECTS),
+            "sources": {
+                "scaleway": [p["name"] for p in COCKPIT_PROJECTS],
+                "pmm": ["local"]
+            },
             "last_push": state["last_push"],
             "last_push_duration_seconds": state["last_push_duration"],
-            "projects_ok": state["projects_ok"],
-            "projects_fail": state["projects_fail"],
+            "sources_ok": state["sources_ok"],
+            "sources_fail": state["sources_fail"],
         }, indent=2).encode("utf-8")
-
+ 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
-
+ 
     def _handle_metrics(self):
-        """Métriques internes du proxy (pas les métriques Cockpit)."""
+        """Métriques internes du proxy."""
         with _state_lock:
             state = dict(_state)
-
+ 
         lines = [
-            "# HELP cockpit_proxy_last_push_duration_seconds Duration of last push cycle\n",
-            "# TYPE cockpit_proxy_last_push_duration_seconds gauge\n",
+            "# HELP monitoring_proxy_last_push_duration_seconds Duration of last push cycle\n",
+            "# TYPE monitoring_proxy_last_push_duration_seconds gauge\n",
         ]
         if state["last_push_duration"] is not None:
-            lines.append(f"cockpit_proxy_last_push_duration_seconds {state['last_push_duration']}\n")
-
-        for name in state.get("projects_ok", []):
-            label = f'scaleway_project="{name}"'
-            lines.append(f"cockpit_proxy_project_up{{{label}}} 1\n")
-        for name in state.get("projects_fail", []):
-            label = f'scaleway_project="{name}"'
-            lines.append(f"cockpit_proxy_project_up{{{label}}} 0\n")
-
+            lines.append(f"monitoring_proxy_last_push_duration_seconds {state['last_push_duration']}\n")
+ 
+        for name in state.get("sources_ok", []):
+            lines.append(f"monitoring_proxy_source_up{{source=\"{name}\"}} 1\n")
+        for name in state.get("sources_fail", []):
+            lines.append(f"monitoring_proxy_source_up{{source=\"{name}\"}} 0\n")
+ 
         body = "".join(lines).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+ 
 
 
 # ---------------------------------------------------------------------------
@@ -401,20 +509,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not PROJECTS:
-        log.error("Aucun projet configuré — vérifier COCKPIT_PROJECTS.")
-        raise SystemExit(1)
-
+    log.info("=== Monitoring Proxy ===")
+    log.info("Scaleway Cockpit projects : %d", len(COCKPIT_PROJECTS))
+    log.info("PMM Prometheus : %s", PMM_PROMETHEUS_URL)
+    log.info("Pushgateway : %s", PUSHGATEWAY_URL)
+    log.info("Intervalle de push : %ds", PUSH_INTERVAL)
+ 
     # Lancement de la boucle de push en arrière-plan
     t = threading.Thread(target=push_loop, daemon=True)
     t.start()
-
-    # Serveur HTTP pour /health et /metrics internes
+ 
+    # Serveur HTTP
     server = HTTPServer(("0.0.0.0", PROXY_PORT), ProxyHandler)
     log.info("Proxy démarré sur :%d", PROXY_PORT)
-    log.info("Projets : %s", [p["name"] for p in PROJECTS])
-    log.info("Pushgateway : %s", PUSHGATEWAY_URL)
-    log.info("Intervalle de push : %ds", PUSH_INTERVAL)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
