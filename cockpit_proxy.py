@@ -92,6 +92,13 @@ PMM_JOBS = [
     "postgres_exporter_*",
 ]
 
+PMM_METRIC_NAMES = [
+    "node_cpu_seconds_total",
+    "node_memory_MemTotal_bytes",
+    "node_memory_MemAvailable_bytes",
+    "pg_stat_database_numbackends",
+    "pg_settings_max_connections",
+]
 
 def load_projects() -> list[dict]:
     raw = os.environ.get("COCKPIT_PROJECTS", "")
@@ -325,9 +332,10 @@ def _build_pmm_job_query() -> str:
     après coup côté proxy (ce qui ne fonctionne pas si la requête initiale
     est déjà rejetée par le serveur).
     """
-    patterns = [job.replace("*", ".*") for job in PMM_JOBS]
-    job_regex = "|".join(patterns)
-    return f'{{job=~"{job_regex}"}}'
+    job_patterns = [job.replace("*", ".*") for job in PMM_JOBS]
+    job_regex = "|".join(job_patterns)
+    name_regex = "|".join(PMM_METRIC_NAMES)
+    return f'{{__name__=~"{name_regex}", job=~"{job_regex}"}}'
 
 
 def scrape_pmm() -> tuple[str, str | None, float]:
