@@ -28,6 +28,13 @@ Configuration via variables d'environnement :
   LOG_LEVEL               DEBUG | INFO | WARNING (défaut : INFO)
   COCKPIT_METRIC_PREFIX   Préfixe pour les métriques Scaleway (défaut : "cockpit_")
   PMM_METRIC_PREFIX       Préfixe pour les métriques PMM/local (défaut : "monitoring_")
+
+NOTE IMPORTANTE (fix) :
+  PMM (VictoriaMetrics) refuse une requête /federate du type {__name__=~".+"}
+  dès que le serveur dépasse ~1 000 000 de timeseries ("the number of matching
+  timeseries exceeds 1000000"). On filtre donc désormais DIRECTEMENT par job
+  (node_exporter_*, postgres_exporter_*) dans la requête envoyée à PMM, au lieu
+  de demander tout puis filtrer après coup côté proxy.
 """
 
 
@@ -138,7 +145,13 @@ def scrape_prometheus(url: str, query: str, auth_user: str = "", auth_password: 
         with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
-        log.warning("HTTP %s lors du scrape de %s", e.code, full_url)
+        # On lit le corps de l'erreur pour le logguer : VictoriaMetrics/Prometheus
+        # renvoie souvent un message précis (ex: dépassement de limite de séries)
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            err_body = ""
+        log.warning("HTTP %s lors du scrape de %s — %s", e.code, full_url, err_body)
         return None, time.monotonic() - t0
     except Exception as e:
         log.warning("Erreur scrape %s : %s", full_url, e)
@@ -300,12 +313,30 @@ def scrape_cockpit_project(project: dict) -> tuple[str, str | None, float]:
     return name, "".join(deduped) + meta, duration
 
 
+def _build_pmm_job_query() -> str:
+    """
+    Construit un sélecteur Prometheus/VictoriaMetrics restreint aux jobs PMM voulus,
+    ex: {job=~"node_exporter_.*|postgres_exporter_.*"}
+
+    IMPORTANT (fix) : VictoriaMetrics (utilisé par PMM) refuse une requête du type
+    {__name__=~".+"} sur un serveur avec beaucoup de métriques : erreur
+    "the number of matching timeseries exceeds 1000000". Il faut donc filtrer
+    par job DIRECTEMENT dans la requête envoyée à /federate, pas seulement
+    après coup côté proxy (ce qui ne fonctionne pas si la requête initiale
+    est déjà rejetée par le serveur).
+    """
+    patterns = [job.replace("*", ".*") for job in PMM_JOBS]
+    job_regex = "|".join(patterns)
+    return f'{{job=~"{job_regex}"}}'
+
+
 def scrape_pmm() -> tuple[str, str | None, float]:
     """Scrape PMM Prometheus. Préfixe toutes les métriques avec PMM_METRIC_PREFIX."""
     t0 = time.monotonic()
 
-    # Scrape tout ce qui n'est pas Scaleway
-    query = '{__name__=~".+"}'
+    # Filtre DIRECTEMENT côté VictoriaMetrics par job (node_exporter / postgres_exporter)
+    # au lieu de {__name__=~".+"} qui dépasse la limite de séries de PMM (voir fix ci-dessus).
+    query = _build_pmm_job_query()
     raw, duration = scrape_prometheus(
         PMM_PROMETHEUS_URL,
         query,
@@ -317,24 +348,18 @@ def scrape_pmm() -> tuple[str, str | None, float]:
         log.warning("[PMM] Erreur scrape")
         return "pmm", None, time.monotonic() - t0
 
-    # Filter par jobs si nécessaire (node_exporter + postgres_exporter)
+    # Filtre de sécurité en post-traitement (garde uniquement les jobs attendus,
+    # au cas où la regex serveur aurait matché plus large que prévu)
     lines = raw.splitlines(keepends=True)
     before = len(lines)
 
-    # Garde juste les jobs PMM (node_exporter, postgres_exporter, etc.)
     filtered_lines = []
     for line in lines:
         stripped = line.strip()
-        # Garde les commentaires
-        if stripped.startswith("#"):
+        if stripped.startswith("#") or not stripped:
             filtered_lines.append(line)
-        elif not stripped:
-            # Ligne vide
+        elif "job=" in stripped and any(job.replace("*", "") in stripped for job in PMM_JOBS):
             filtered_lines.append(line)
-        else:
-            # Pour les séries, filtre par job
-            if "job=" in stripped and any(job.replace("*", "") in stripped for job in PMM_JOBS):
-                filtered_lines.append(line)
 
     dropped = before - len(filtered_lines)
     if dropped:
