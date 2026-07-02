@@ -403,16 +403,17 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
         method="PUT",
         headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
+    # Dans push_to_gateway, pour le PUT :
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             log.debug("Push OK [%s] : HTTP %s", instance, resp.status)
             return True
     except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            err_body = ""
+        err_body = e.read().decode("utf-8", errors="replace")[:300]
         log.error("Erreur push [%s] HTTP %s — %s", instance, e.code, err_body)
+        return False
+    except urllib.error.URLError as e:
+        log.error("Erreur réseau push [%s] : %s", instance, e.reason)
         return False
 
 # récupère info de cockpit et mpp et push
@@ -441,9 +442,15 @@ def scrape_and_push():
                 results[name] = (None, 0)
 
     all_ok = True
+    # Dans scrape_and_push, pour isoler chaque push :
     for name, (text, duration) in results.items():
         if text:
-            ok = push_to_gateway("monitoring-proxy", name, text)
+            try:
+                ok = push_to_gateway("monitoring-proxy", name, text)
+            except Exception as e:
+                log.error("[%s] Exception pendant le push : %s", name, e)
+                ok = False
+    
             if ok:
                 sources_ok.append(name)
                 log.info("[%s] push OK", name)
