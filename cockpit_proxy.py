@@ -100,6 +100,8 @@ PMM_METRIC_NAMES = [
     "pg_settings_max_connections",
 ]
 
+_RE_STRIP_TS = re.compile(r'^(?P<metric>\S+)\s+(?P<value>\S+)\s+(?P<ts>-?\d+(?:\.\d+)?)\s*$')
+
 def load_projects() -> list[dict]:
     raw = os.environ.get("COCKPIT_PROJECTS", "")
     if not raw:
@@ -131,6 +133,21 @@ _state = {
     "sources_ok": [],
     "sources_fail": [],
 }
+
+def _strip_timestamp(line: str) -> str:
+    """
+    Retire le timestamp explicite d'une ligne de métrique Prometheus.
+    Le Pushgateway rejette tout push contenant un timestamp
+    (HTTP 400: 'pushed metrics must not have timestamps').
+    Ex: my_metric{x="1"} 42 1719900931277  ->  my_metric{x="1"} 42
+    """
+    stripped = line.rstrip("\n")
+    if not stripped or stripped.startswith("#"):
+        return line
+    m = _RE_STRIP_TS.match(stripped)
+    if m:
+        return f"{m.group('metric')} {m.group('value')}\n"
+    return line
 
 def scrape_prometheus(url: str, query: str, auth_user: str = "", auth_password: str = "") -> tuple[str | None, float]:
     """
@@ -299,6 +316,7 @@ def scrape_cockpit_project(project: dict) -> tuple[str, str | None, float]:
     labeled = [_inject_label(line, label) for line in lines]
     # 2) Préfixe du nom de la métrique -> cockpit_xxx
     prefixed = [_prefix_metric_name(line, COCKPIT_METRIC_PREFIX) for line in labeled]
+    prefixed = [_strip_timestamp(line) for line in prefixed]
 
     # Dédup
     deduped = _deduplicate(prefixed)
@@ -375,7 +393,7 @@ def scrape_pmm() -> tuple[str, str | None, float]:
 
     # Préfixe du nom de la métrique -> monitoring_xxx
     prefixed = [_prefix_metric_name(line, PMM_METRIC_PREFIX) for line in filtered_lines]
-
+    prefixed = [_strip_timestamp(line) for line in prefixed]
     # Dédup
     deduped = _deduplicate(prefixed)
     log.debug(
