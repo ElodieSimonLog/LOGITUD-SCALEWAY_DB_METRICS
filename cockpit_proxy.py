@@ -133,6 +133,7 @@ _state = { # mémoire partagé entre pmm et cockpit pour savoir si le dernier pu
     "sources_fail": [],
 }
 
+
 # retire le timestamp d'une ligne (notamment de pmm vu que VictoriaMetrics met un timestamp)
 # parce que le pushgateway n'accepte pas les métriques avec timestamp
 # Ex : my_metric{x="1"} 42 1719900931277  ->  my_metric{x="1"} 42
@@ -265,6 +266,41 @@ def _deduplicate(lines: list[str]) -> list[str]:
     result.extend(metric_lines.values())
     return result
 
+def _extract_pmm_project(node_name: str) -> str | None:
+    """
+    Extrait le nom du projet/service depuis node_name.
+    Ex: "postgres-repository-postgres-repository-cluster-postgres-repository-nqxj-0"
+        -> "postgres-repository"
+    """
+    if not node_name:
+        return None
+
+    prefix = node_name.split("-cluster-")[0] if "-cluster-" in node_name else node_name
+    tokens = prefix.split("-")
+
+    n = len(tokens)
+    if n % 2 == 0 and tokens[:n // 2] == tokens[n // 2:]:
+        return "-".join(tokens[:n // 2])
+
+    return prefix
+
+
+_RE_NODE_NAME = re.compile(r'node_name="([^"]*)"')
+
+
+def _inject_pmm_project(line: str) -> str:
+    """Ajoute un label pmm_project="..." déduit de node_name (convention CloudNativePG)."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return line
+    m = _RE_NODE_NAME.search(stripped)
+    if not m:
+        return line
+    project = _extract_pmm_project(m.group(1))
+    if not project:
+        return line
+    return _inject_label(line, f'pmm_project="{project}"')
+
 # récupère le nom du projet depuis l'objet python et prépare le texte du label
 def scrape_cockpit_project(project: dict) -> tuple[str, str | None, float]:
     # construit l'url complète pour le scrape, avec le label scaleway_project et le token d'authentification
@@ -360,9 +396,9 @@ def scrape_pmm() -> tuple[str, str | None, float]:
     if dropped:
         log.debug("[PMM] %d lignes filtrées (jobs non-PMM)", dropped)
 
-    prefixed = [_prefix_metric_name(line, PMM_METRIC_PREFIX) for line in filtered_lines]
+    prefixed = [_inject_pmm_project(line) for line in filtered_lines]
+    prefixed = [_prefix_metric_name(line, PMM_METRIC_PREFIX) for line in prefixed]
     prefixed = [_strip_timestamp(line) for line in prefixed]
-    # Dédup
     deduped = _deduplicate(prefixed)
     log.debug(
         "[PMM] scrape OK en %.2fs — %d lignes → %d après filtre+dédup",
