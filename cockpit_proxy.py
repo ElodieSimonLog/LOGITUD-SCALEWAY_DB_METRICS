@@ -428,10 +428,11 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
             log.debug("Push OK [%s] : HTTP %s", instance, resp.status)
             return True
     except urllib.error.HTTPError as e:
-        log.error("Erreur push [%s] HTTP %s", instance, e.code)
-        return False
-    except Exception as e:
-        log.error("Erreur push [%s] : %s", instance, e)
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            err_body = ""
+        log.error("Erreur push [%s] HTTP %s — %s", instance, e.code, err_body)
         return False
 
 
