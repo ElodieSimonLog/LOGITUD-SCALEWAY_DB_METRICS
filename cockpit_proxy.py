@@ -482,6 +482,7 @@ def scrape_and_push():
     for name, (text, duration) in results.items():
         if text:
             try:
+                log.info('[%s] taille payload PUT : %d octets / %d lignes', name, len(text.encode('utf-8')), text.count('\n'))
                 ok = push_to_gateway("monitoring-proxy", name, text)
             except Exception as e:
                 log.error("[%s] Exception pendant le push : %s", name, e)
