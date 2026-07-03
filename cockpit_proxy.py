@@ -17,6 +17,13 @@ Expose aussi :
 
 Configuration via variables d'environnement :
   COCKPIT_PROJECTS        JSON : liste de projets Scaleway
+  COCKPIT_METRIC_NAMES    Liste de noms de métriques Cockpit à fédérer,
+                           séparés par des virgules (défaut : voir
+                           DEFAULT_COCKPIT_METRIC_NAMES ci-dessous).
+                           Remplace le comportement précédent qui fédérait
+                           TOUT ({__name__=~".+"}), responsable de payloads
+                           énormes et de coupures réseau sur les gros
+                           projets (cf. fix ci-dessous).
   PUSHGATEWAY_URL         URL du Pushgateway
   PUSH_INTERVAL           Intervalle de push en secondes (défaut : 60)
   PMM_PROMETHEUS_URL      URL du Prometheus de PMM
@@ -25,16 +32,46 @@ Configuration via variables d'environnement :
   PMM_BASIC_AUTH_PASSWORD Mot de passe PMM (défaut : "")
   PROXY_PORT              Port d'écoute (défaut : 8000)
   SCRAPE_TIMEOUT          Timeout par scrape en secondes (défaut : 30)
+  PUSH_TIMEOUT            Timeout par PUT vers le Pushgateway (défaut : 30)
+  PUSH_MAX_RETRIES        Nombre de tentatives supplémentaires sur le PUT
+                           en cas d'erreur réseau (défaut : 2)
+  PUSH_RETRY_BACKOFF      Délai (s) entre deux tentatives de PUT (défaut : 2)
   LOG_LEVEL               DEBUG | INFO | WARNING (défaut : INFO)
   COCKPIT_METRIC_PREFIX   Préfixe pour les métriques Scaleway (défaut : "cockpit_")
   PMM_METRIC_PREFIX       Préfixe pour les métriques PMM/local (défaut : "monitoring_")
 
-NOTE IMPORTANTE (fix) :
+NOTE IMPORTANTE (fix historique PMM) :
   PMM (VictoriaMetrics) refuse une requête /federate du type {__name__=~".+"}
   dès que le serveur dépasse ~1 000 000 de timeseries ("the number of matching
-  timeseries exceeds 1000000"). On filtre donc désormais DIRECTEMENT par job
+  timeseries exceeds 1000000"). On filtre donc DIRECTEMENT par job
   (node_exporter_*, postgres_exporter_*) dans la requête envoyée à PMM, au lieu
   de demander tout puis filtrer après coup côté proxy.
+
+NOTE IMPORTANTE (fix Cockpit — juillet 2026) :
+  Le même problème existait côté Scaleway Cockpit mais de façon plus sournoise :
+  la requête {__name__=~".+"} passait le scrape (pas d'erreur HTTP), mais le
+  payload résultant pour les gros projets (prod-secu, prod-bi, prod-pop, ...)
+  était assez volumineux pour se faire couper ("Connection reset by peer") lors
+  du PUT vers le Pushgateway — probablement à cause d'une limite de taille sur
+  un composant réseau intermédiaire (ingress / sidecar). Les petits projets
+  (ex: "terraform") passaient sans problème, ce qui rendait le bug difficile à
+  repérer : /health montrait des échecs, mais les dashboards affichaient des
+  métriques à 0% pour le seul projet qui remontait, sans erreur visible.
+
+  Fix appliqué :
+    1. Filtrage par nom de métrique côté Cockpit (COCKPIT_METRIC_NAMES),
+       exactement comme c'est déjà fait pour PMM. Réduit fortement le volume
+       de données fédérées et donc la taille du payload PUT.
+    2. Log explicite de la taille du payload par projet avant le push, pour
+       repérer immédiatement un futur problème de volume.
+    3. Retry avec backoff sur le PUT en cas d'erreur réseau transitoire
+       (les DELETE, eux, sont déjà non bloquants).
+
+  À ADAPTER : la liste DEFAULT_COCKPIT_METRIC_NAMES ci-dessous est un point de
+  départ (CPU, mémoire, connexions, I/O disque, réseau — utile aussi pour
+  repérer une activité anormale type dump de base). Vérifiez les noms exacts
+  exposés par votre Cockpit via un scrape brut (voir README / discussion) et
+  ajustez la liste ou la variable d'env COCKPIT_METRIC_NAMES en conséquence.
 """
 import json
 import logging
@@ -60,6 +97,9 @@ log = logging.getLogger("cockpit-proxy")
 PROXY_PORT      = int(os.environ.get("PROXY_PORT", "8000")) #pour petit serveur interne avec l'état du scrape et du pod
 SCRAPE_TIMEOUT  = int(os.environ.get("SCRAPE_TIMEOUT", "30")) # combien de secondes max on attend un scrape avant d'abandonner
 PUSH_INTERVAL   = int(os.environ.get("PUSH_INTERVAL", "60")) #combien de seconde entre chaque push vers le pushgateway
+PUSH_TIMEOUT       = int(os.environ.get("PUSH_TIMEOUT", "30")) # timeout du PUT vers le pushgateway
+PUSH_MAX_RETRIES   = int(os.environ.get("PUSH_MAX_RETRIES", "2")) # tentatives supplémentaires sur le PUT si erreur réseau
+PUSH_RETRY_BACKOFF = float(os.environ.get("PUSH_RETRY_BACKOFF", "2")) # secondes entre deux tentatives
 
 # Les variables d'env récupéré 
 PUSHGATEWAY_URL = os.environ.get(
@@ -80,6 +120,8 @@ COCKPIT_METRIC_PREFIX = os.environ.get("COCKPIT_METRIC_PREFIX", "cockpit_") #ren
 PMM_METRIC_PREFIX     = os.environ.get("PMM_METRIC_PREFIX", "monitoring_")#renommer les métriques de cockpit de node_... en monitoring_...
 
 # rejette des métrics inutiles genre object_storage_bucket_*, qui sont très nombreuses et inutiles pour nous
+# (conservé comme filet de sécurité même si le filtrage par nom ci-dessous rend
+#  ce blacklist normalement redondant pour Cockpit)
 METRIC_BLACKLIST_RE = re.compile(
     r'^(?:# (?:HELP|TYPE) )?object_storage_bucket_' 
 )
@@ -97,6 +139,33 @@ PMM_METRIC_NAMES = [
     "pg_stat_database_numbackends",
     "pg_settings_max_connections",
 ]
+
+# Liste par défaut des métriques Cockpit fédérées (fix : avant, on demandait TOUT
+# via {__name__=~".+"}, ce qui produisait des payloads trop gros pour les gros
+# projets et faisait planter le PUT vers le Pushgateway ("Connection reset by
+# peer"). On ne demande maintenant que ce qui est utile : charge CPU/mémoire,
+# connexions PostgreSQL, et de quoi repérer une activité I/O/réseau anormale
+# (ex: dump de base de données).
+# À ADAPTER selon les noms réels exposés par votre Cockpit (vérifiez avec un
+# scrape brut du endpoint /federate d'un projet).
+DEFAULT_COCKPIT_METRIC_NAMES = [
+    "rdb_instance_postgresql_node_cpu_seconds_total",
+    "rdb_instance_postgresql_node_memory_MemTotal_bytes",
+    "rdb_instance_postgresql_node_memory_MemAvailable_bytes",
+    "rdb_instance_postgresql_node_disk_read_bytes_total",
+    "rdb_instance_postgresql_node_disk_write_bytes_total",
+    "rdb_instance_postgresql_node_network_receive_bytes_total",
+    "rdb_instance_postgresql_node_network_transmit_bytes_total",
+    "rdb_instance_postgresql_pg_stat_database_numbackends",
+    "rdb_instance_postgresql_pg_settings_max_connections",
+]
+
+_raw_cockpit_names = os.environ.get("COCKPIT_METRIC_NAMES", "")
+COCKPIT_METRIC_NAMES = (
+    [n.strip() for n in _raw_cockpit_names.split(",") if n.strip()]
+    if _raw_cockpit_names
+    else DEFAULT_COCKPIT_METRIC_NAMES
+)
 
 _RE_STRIP_TS = re.compile(r'^(?P<metric>\S+)\s+(?P<value>\S+)\s+(?P<ts>-?\d+(?:\.\d+)?)\s*$') # isole et enlève le timestamp pour garder que métric, valeur
 
@@ -122,6 +191,11 @@ def load_projects() -> list[dict]:
 
 
 COCKPIT_PROJECTS = load_projects() #stocke les objets dans une variable globale pour les utiliser plus tard dans le script
+
+log.info(
+    "Cockpit : %d métrique(s) fédérée(s) par projet : %s",
+    len(COCKPIT_METRIC_NAMES), COCKPIT_METRIC_NAMES
+)
 
 
 _state_lock = threading.Lock()
@@ -186,14 +260,25 @@ _RE_METRIC_NAME     = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*?\})?(\s+.*)$
 
 # ajoute un label à une ligne de métrique Prometheus, en gérant les cas avec ou sans labels existants
 def _inject_label(line: str, label_kv: str) -> str:
-    """Injecte un label dans une ligne de métrique Prometheus."""
+    """Injecte un label dans une ligne de métrique Prometheus.
+
+    Si un label du même nom existe déjà sur la ligne (ex: la source expose
+    déjà "scaleway_project"), on ne le rajoute PAS une deuxième fois : un
+    label dupliqué dans les accolades rend la ligne invalide côté Pushgateway
+    et fait échouer tout le push pour ce projet.
+    """
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         return line
 
+    label_name = label_kv.split("=", 1)[0]
+
     m = _RE_WITH_LABELS.match(stripped)
     if m: #si y a labels existants, on ajoute le nouveau label à la liste des labels existants
         name, existing, rest = m.groups()
+        existing_names = {kv.split("=", 1)[0].strip() for kv in existing.split(",") if kv.strip()}
+        if label_name in existing_names:
+            return line
         new_labels = f"{existing},{label_kv}" if existing else label_kv
         return f"{name}{{{new_labels}}}{rest}\n"
 
@@ -301,13 +386,27 @@ def _inject_pmm_project(line: str) -> str:
         return line
     return _inject_label(line, f'pmm_project="{project}"')
 
+
+# construit la requête /federate pour Cockpit : filtrée par nom de métrique,
+# comme pour PMM, au lieu de fédérer {__name__=~".+"} (fix du 07/2026)
+def _build_cockpit_query() -> str:
+    if not COCKPIT_METRIC_NAMES:
+        # filet de sécurité : si la liste est vide par erreur de config, on
+        # revient à l'ancien comportement plutôt que de faire une requête
+        # invalide (mais ça reproduira le bug de payload trop gros)
+        log.warning("COCKPIT_METRIC_NAMES est vide — fédération de TOUTES les métriques (déconseillé)")
+        return '{__name__=~".+"}'
+    name_regex = "|".join(re.escape(n) for n in COCKPIT_METRIC_NAMES)
+    return f'{{__name__=~"{name_regex}"}}'
+
+
 # récupère le nom du projet depuis l'objet python et prépare le texte du label
 def scrape_cockpit_project(project: dict) -> tuple[str, str | None, float]:
     # construit l'url complète pour le scrape, avec le label scaleway_project et le token d'authentification
     name  = project["name"]
     label = f'scaleway_project="{name}"'
     base  = project["url"].rstrip("/") + "/federate"
-    query = urlencode({"match[]": '{__name__=~".+"}'})
+    query = urlencode({"match[]": _build_cockpit_query()})
     url   = f"{base}?{query}"
     token = project["token"]
 
@@ -419,7 +518,12 @@ def scrape_pmm() -> tuple[str, str | None, float]:
 
 # construit l'url en insérant le job et l'instance, puis envoie d'abord un DELETE pour supprimer les anciennes métriques, puis un PUT pour envoyer les nouvelles métriques
 def push_to_gateway(job: str, instance: str, data: str) -> bool:
-    """Pousse les métriques vers le Pushgateway via DELETE puis PUT."""
+    """Pousse les métriques vers le Pushgateway via DELETE puis PUT.
+
+    Le PUT est retenté (PUSH_MAX_RETRIES fois, avec un backoff de
+    PUSH_RETRY_BACKOFF secondes) en cas d'erreur réseau transitoire
+    (ex: "Connection reset by peer" observé sur les gros payloads Cockpit).
+    """
     base_url = f"{PUSHGATEWAY_URL}/metrics/job/{job}/instance/{instance}"
 
     try: #delete pour vider les anciennes métriques avant de push les nouvelles mais même si le delete marche pas on fit quand même le put
@@ -433,24 +537,38 @@ def push_to_gateway(job: str, instance: str, data: str) -> bool:
         log.warning("DELETE [%s] échoué (non bloquant) : %s", instance, e)
 
     body = data.encode("utf-8")
-    req = urllib.request.Request( #envoie la requete, avec un PUT pour push les métriques vers le pushgateway, avec un header Content-Type pour indiquer que c'est du texte brut Prometheus
-        base_url,
-        data=body,
-        method="PUT",
-        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+    payload_size = len(body)
+    log.info(
+        "[%s] taille payload PUT : %d octets / %d lignes",
+        instance, payload_size, data.count("\n")
     )
-    # Dans push_to_gateway, pour le PUT :
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            log.debug("Push OK [%s] : HTTP %s", instance, resp.status)
-            return True
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:300]
-        log.error("Erreur push [%s] HTTP %s — %s", instance, e.code, err_body)
-        return False
-    except urllib.error.URLError as e:
-        log.error("Erreur réseau push [%s] : %s", instance, e.reason)
-        return False
+
+    attempt = 0
+    while True:
+        attempt += 1
+        req = urllib.request.Request( #envoie la requete, avec un PUT pour push les métriques vers le pushgateway, avec un header Content-Type pour indiquer que c'est du texte brut Prometheus
+            base_url,
+            data=body,
+            method="PUT",
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT) as resp:
+                log.debug("Push OK [%s] : HTTP %s (tentative %d)", instance, resp.status, attempt)
+                return True
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:300]
+            log.error("Erreur push [%s] HTTP %s — %s", instance, e.code, err_body)
+            return False  # erreur HTTP franche (ex: 400 payload invalide) : inutile de retenter
+        except urllib.error.URLError as e:
+            log.warning(
+                "Erreur réseau push [%s] (tentative %d/%d) : %s",
+                instance, attempt, PUSH_MAX_RETRIES + 1, e.reason
+            )
+            if attempt > PUSH_MAX_RETRIES:
+                log.error("Erreur réseau push [%s] : abandon après %d tentatives", instance, attempt)
+                return False
+            time.sleep(PUSH_RETRY_BACKOFF)
 
 # récupère info de cockpit et mpp et push
 def scrape_and_push(): 
@@ -482,7 +600,6 @@ def scrape_and_push():
     for name, (text, duration) in results.items():
         if text:
             try:
-                log.info('[%s] taille payload PUT : %d octets / %d lignes', name, len(text.encode('utf-8')), text.count('\n'))
                 ok = push_to_gateway("monitoring-proxy", name, text)
             except Exception as e:
                 log.error("[%s] Exception pendant le push : %s", name, e)
@@ -552,6 +669,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "cockpit": COCKPIT_METRIC_PREFIX,
                 "pmm": PMM_METRIC_PREFIX,
             },
+            "cockpit_metric_names": COCKPIT_METRIC_NAMES,
             "last_push": state["last_push"],
             "last_push_duration_seconds": state["last_push_duration"],
             "sources_ok": state["sources_ok"],
